@@ -996,125 +996,92 @@ def markdownv2_to_rich_markdown(text: str) -> str:
     header()/spoiler()/quote_expandable() и т.д. по всему файлу) в текст,
     валидный для поля rich_message.markdown (Bot API 10.1+).
 
-    ПОЧЕМУ ЭТО ВООБЩЕ НУЖНО: rich-markdown — это НЕ тот же диалект, что
-    parse_mode=MarkdownV2, хотя выглядит похоже. Два конкретных отличия,
-    из-за которых без конвертера рич-экраны показывали пользователю
-    сырую разметку ("jdjfjf **>jfkfif||"):
-      1. Экранирование другое. В MarkdownV2 бэкслешем экранируется целый
-         набор спецсимволов (подчёркивание, звёздочка, квадратные и
-         круглые скобки, тильда, обратная кавычка, знак больше, решётка,
-         плюс, минус, равно, вертикальная черта, фигурные скобки, точка,
-         восклицательный знак, обратный слеш), и esc() честно
-         экранирует их все. В rich-markdown (GFM) экранировать нужно
-         только подчёркивание, звёздочку, обратный слеш и квадратную
-         скобку, и то не внутри уже открытой entity — все
-         остальные экранированные точки, восклицательные знаки, дефисы
-         и т.п. остаются в тексте буквально
-         как обратный слеш+символ, потому что для rich-markdown это не
-         спецсимволы, экранировать их не нужно.
-      2. Часть форматирования из MarkdownV2 в rich-markdown отсутствует
-         как таковая — официальная документация Bot API прямо говорит:
-         "There is no way to specify 'underline', 'strikethrough',
-         'spoiler', 'blockquote', 'expandable_blockquote', 'custom_emoji'
-         и 'date_time' entities [в rich-markdown], use parse mode
-         MarkdownV2 instead". Но rich-markdown разрешает произвольные
-         HTML-вставки (GFM + HTML) — именно ими эти сущности здесь и
-         эмулируются: <blockquote>, <blockquote expandable>,
-         <tg-spoiler>, <u>.
+    Rich Markdown — это GFM-совместимый диалект (официальные спеки Rich
+    Message Formatting), и многое он понимает сам, без переделки:
+      * > — блочную цитату (то же, что quote());
+      * ||...|| — спойлер (то же, что spoiler());
+      * `...` — инлайн-код;
+      * \\X — экранирование пунктуации (\\. \\- \\| \\> и т.д.) работает
+        ровно как в MarkdownV2, поэтому esc() переделывать не нужно.
+
+    Здесь устраняются только РЕАЛЬНЫЕ отличия диалектов:
+      1. Жирный: MarkdownV2 — *bold*, Rich Markdown (GFM) — **bold**.
+         Неэкранированные одиночные * (вне code-спанов) удваиваются.
+      2. Раскрывающаяся цитата MarkdownV2 (**>текст||) в Rich Markdown
+         не существует — вместо неё <details> (markdown внутри <details>
+         парсится, поэтому экранирование внутри не трогаем).
+      3. Внутри code-спанов MarkdownV2 требует экранировать \\ и `
+         (так делает esc_code()), а GFM рендерит содержимое code-span
+         буквально — это экранирование снимается.
+      4. Заголовок экрана (header() → однострочная цитата с болдом
+         ">**текст**") превращается в нативный заголовок "## текст".
 
     Это единая точка конвертации — правится один раз здесь, а не в 150+
-    местах по файлу, где строится текст экранов. Все show_screen()/
-    send_rich_message()/edit_rich_message() пропускают текст через неё
-    автоматически перед rich-вызовом; обычный MarkdownV2-fallback
-    получает исходный текст как есть, без изменений.
+    местах по файлу. Все show_screen()/send_rich_message()/edit_rich_message()
+    пропускают текст через неё перед rich-вызовом; обычный MarkdownV2-
+    fallback получает исходный текст как есть.
     """
     if not text:
         return text
 
+    _CODE_SPAN = r'`(?:[^`\\\n]|\\.)*`'
+
     # 1. Раскрывающаяся цитата MarkdownV2: первая строка "**>текст",
     #    остальные ">текст", последняя заканчивается "||" (см.
-    #    quote_expandable()) -> <blockquote expandable>текст</blockquote>.
-    #    Строим построчно, поскольку это блочная, а не инлайн-конструкция.
-    #    ВАЖНО: делаем это ДО замены спойлеров ||...||, иначе завершающее
-    #    "||" expandable-цитаты ошибочно съедается как начало/конец
-    #    отдельного спойлера (в тексте нет второй пары "||" для него).
-    def _convert_expandable_blocks(src: str) -> str:
+    #    quote_expandable()) -> <details><summary>текст</summary>…</details>.
+    def _convert_expandable(src: str) -> str:
         lines = src.split("\n")
         out = []
         i = 0
         while i < len(lines):
             line = lines[i]
-            if line.startswith("**>"):
-                first = line[3:]
-                # Однострочный случай: quote_expandable() на однострочном
-                # входе даёт "**>текст||" целиком в одной строке — нет
-                # отдельной продолжающей ">"-строки, куда обычно попадает
-                # завершающее "||".
-                if first.endswith("||") and (i + 1 >= len(lines) or not lines[i + 1].startswith(">")):
-                    out.append("<blockquote expandable>" + first[:-2] + "</blockquote>")
-                    i += 1
-                    continue
-                block = [first]
+            if not line.startswith("**>"):
+                out.append(line)
                 i += 1
-                while i < len(lines) and lines[i].startswith(">"):
-                    content = lines[i][1:]
-                    if content.endswith("||") and (i + 1 >= len(lines) or not lines[i + 1].startswith(">")):
-                        content = content[:-2]
-                        block.append(content)
-                        i += 1
-                        break
-                    block.append(content)
-                    i += 1
-                out.append("<blockquote expandable>" + "\n".join(block) + "</blockquote>")
                 continue
-            out.append(line)
-            i += 1
-        return "\n".join(out)
-    text = _convert_expandable_blocks(text)
-
-    # 2. Спойлер ||...|| -> <tg-spoiler>...</tg-spoiler> (GFM markdown не
-    #    знает ||...||, зато rich-markdown разрешает HTML-теги для того,
-    #    чего нет в самом GFM). После шага 1 в тексте остались только
-    #    настоящие спойлеры — expandable-цитаты уже вырезаны в HTML.
-    text = re.sub(r'\|\|(.+?)\|\|', r'<tg-spoiler>\1</tg-spoiler>', text, flags=re.DOTALL)
-
-    # 3. Обычная цитата MarkdownV2 (quote(): каждая строка с ">") ->
-    #    HTML <blockquote>, чтобы не полагаться на то, встроит ли
-    #    конкретный клиент голый ">"-GFM-quote так же, как Telegram-quote.
-    def _convert_plain_quote_blocks(src: str) -> str:
-        lines = src.split("\n")
-        out = []
-        i = 0
-        while i < len(lines):
-            if lines[i].startswith(">") and not lines[i].startswith(">>"):
-                block = []
-                while i < len(lines) and lines[i].startswith(">"):
-                    block.append(lines[i][1:])
-                    i += 1
-                out.append("<blockquote>" + "\n".join(block) + "</blockquote>")
+            first = line[3:]
+            # Однострочный случай: "**>текст||" целиком в одной строке.
+            if first.endswith("||") and (i + 1 >= len(lines) or not lines[i + 1].startswith(">")):
+                out.append("<details><summary>" + first[:-2] + "</summary></details>")
+                i += 1
                 continue
-            out.append(lines[i])
+            body = [first]
             i += 1
+            while i < len(lines) and lines[i].startswith(">"):
+                content = lines[i][1:]
+                if content.endswith("||") and (i + 1 >= len(lines) or not lines[i + 1].startswith(">")):
+                    content = content[:-2]
+                    body.append(content)
+                    i += 1
+                    break
+                body.append(content)
+                i += 1
+            out.append("<details><summary>" + body[0] + "</summary>\n" + "\n".join(body[1:]) + "</details>")
         return "\n".join(out)
-    text = _convert_plain_quote_blocks(text)
 
-    # 4. Снимаем экранирование MarkdownV2 у символов, которые в
-    #    rich-markdown (GFM) экранировать не нужно: . ! - = + # { } > ~ ( )
-    #    Оставляем экранированными _ * ` [ ] \ — они и в GFM значимы
-    #    (курсив/жирный/код/ссылки).
-    text = re.sub(r'\\([.!\-=+#{}>~()])', r'\1', text)
+    text = _convert_expandable(text)
 
-    # 5. Жирный текст: MarkdownV2 использует одинарные звёздочки *bold*,
-    #    GFM (rich-markdown) — двойные **bold**. Меняем непарные
-    #    одинарные * (не часть уже существующих **) на **.
-    #    Работаем по неэкранированным одиночным * вне code-спанов.
-    def _double_up_bold(src: str) -> str:
-        # Защищаем code-спаны (`...`), чтобы не трогать код внутри.
-        parts = re.split(r'(`[^`]*`)', src)
-        for idx in range(0, len(parts), 2):  # чётные индексы — не code
-            parts[idx] = re.sub(r'(?<!\*)\*(?!\*)', '**', parts[idx])
-        return "".join(parts)
-    text = _double_up_bold(text)
+    # 2. Жирный: *bold* -> **bold**. Не трогаем code-спаны и уже экранированные
+    #    \* (литеральные звёздочки пользователя).
+    parts = re.split(r'(' + _CODE_SPAN + r')', text)
+    for idx in range(0, len(parts), 2):  # чётные индексы — не code-span
+        parts[idx] = re.sub(r'(?<![\\*])\*(?!\*)', '**', parts[idx])
+    text = "".join(parts)
+
+    # 3. code-спаны: снимаем MarkdownV2-экранирование \\ и \` — GFM рендерит
+    #    содержимое code-span буквально, без обработки бэкслеш-экранирования.
+    def _fix_code_span(m):
+        inner = m.group(0)[1:-1]
+        return "`" + inner.replace("\\`", "`").replace("\\\\", "\\") + "`"
+
+    text = re.sub(_CODE_SPAN, _fix_code_span, text)
+
+    # 4. Заголовки экранов: header() даёт однострочную цитату с болдом
+    #    ">**текст**" — превращаем её в нативный заголовок Rich Markdown.
+    def _heading(m):
+        return "## " + m.group(1)
+
+    text = re.sub(r'^>\*\*(.+?)\*\*$', _heading, text, flags=re.MULTILINE)
 
     return text
 
@@ -1126,15 +1093,13 @@ def markdownv2_to_rich_markdown(text: str) -> str:
 #  editMessageText с параметром rich_message), в обход PTB.
 # ══════════════════════════════════════════════════════════════════
 #
-# InputRichMessage поддерживает либо готовый текст в поле "markdown"/"html"
-# (собственный GFM-совместимый диалект, отличный от parse_mode=MarkdownV2 —
-# см. markdownv2_to_rich_markdown() выше), либо явное дерево блоков
-# ("blocks"). Мы используем текстовый вариант: экраны по-прежнему пишутся
-# на обычном MarkdownV2 через esc()/quote()/header(), а перед отправкой в
-# rich-путь текст прогоняется через markdownv2_to_rich_markdown() — так
+# InputRichMessage принимает ровно одно из полей "markdown"/"html"/"blocks".
+# Здесь используется текстовый вариант: экраны по-прежнему пишутся на обычном
+# MarkdownV2 через esc()/quote()/header()/spoiler()/quote_expandable(), а перед
+# rich-отправкой текст прогоняется через markdownv2_to_rich_markdown() — так
 # сами экраны не пришлось переписывать под два разных диалекта разметки.
-# Кнопки (reply_markup) идут отдельным полем, как и в обычном sendMessage —
-# на сами рич-блоки это не влияет.
+# Кнопки идут отдельным полем reply_markup, как и в обычном sendMessage
+# (встроенных в тело сообщения кнопок в Rich API нет — только reply_markup).
 
 async def _rich_api_call(method: str, payload: dict) -> dict:
     """
@@ -1196,86 +1161,6 @@ def markup_to_payload(reply_markup, disabled_callbacks=None, force_reply: bool =
     return data
 
 
-def rich_button(text: str, callback_data: str = None, url: str = None) -> dict:
-    """RichMessageButton (Bot API 10.3) — та же форма, что и обычная
-    InlineKeyboardButton, но живёт ВНУТРИ потока rich-контента (см.
-    RichBlockButtons ниже), а не только приклеена одним блоком под
-    сообщением. Схема поля пока не задокументирована в открытом виде
-    настолько подробно, как остальной Rich Markdown — это осторожная,
-    best-effort реализация по аналогии с InlineKeyboardButton."""
-    btn = {"text": text}
-    if callback_data is not None:
-        btn["callback_data"] = callback_data
-    if url is not None:
-        btn["url"] = url
-    return btn
-
-
-def rich_buttons_block(rows) -> dict:
-    """
-    InputRichBlockButtons (Bot API 10.3) — блок с кнопками, который можно
-    вставить МЕЖДУ другими блоками в потоке rich-контента (например, сразу
-    под описанием конкретного пункта списка), а не одной общей клавиатурой
-    в самом низу сообщения. rows — список рядов, каждый ряд — список
-    rich_button(...). ЭКСПЕРИМЕНТАЛЬНО: точная форма этого блока не
-    подтверждена официальными примерами (класс добавлен 24.08.2026), поэтому
-    вызов оборачивается в send_rich_blocks/edit_rich_blocks, которые тихо
-    откатываются на проверенный способ (общая reply_markup-клавиатура),
-    если Bot API отклонит именно этот блок.
-    """
-    return {"type": "buttons", "buttons": rows}
-
-
-def rich_paragraph(text: str) -> dict:
-    """RichBlockParagraph с обычной (неформатированной) строкой — RichText
-    по спецификации может быть простой String, форматирование внутри
-    параграфа при таком способе не парсится как markdown (это уже не
-    markdown-режим, а структурный blocks-режим), поэтому сюда идёт
-    голый текст без esc()."""
-    return {"type": "paragraph", "text": text}
-
-
-def rich_heading(text: str, size: int = 3) -> dict:
-    """RichBlockSectionHeading — заголовок секции внутри blocks-режима."""
-    return {"type": "heading", "text": text, "size": size}
-
-
-async def send_rich_blocks(chat_id, blocks: list, reply_markup=None) -> int:
-    """
-    sendRichMessage через структурный blocks-режим (Bot API 10.2+) вместо
-    markdown-режима — нужен, когда контент включает RichBlockButtons
-    (кнопки ВСТРОЕННЫЕ в тело сообщения, Bot API 10.3), которых нет в
-    задокументированном markdown-синтаксисе. Возвращает message_id при
-    успехе, иначе None — вызывающий код должен откатиться на
-    send_rich_message/show_screen с обычной markdown-строкой и
-    reply_markup-клавиатурой.
-    """
-    payload = {"chat_id": chat_id, "rich_message": {"blocks": blocks}}
-    if reply_markup is not None:
-        payload["reply_markup"] = reply_markup.to_dict() if hasattr(reply_markup, "to_dict") else reply_markup
-    data = await _rich_api_call("sendRichMessage", payload)
-    if data.get("ok"):
-        result = data.get("result") or {}
-        if "message_id" in result:
-            return result["message_id"]
-    logging.info(f"sendRichMessage(blocks) недоступен, нужен откат на markdown: {data.get('description')}")
-    return None
-
-
-async def edit_rich_blocks(chat_id, message_id, blocks: list, reply_markup=None) -> bool:
-    """editMessageText(rich_message={'blocks': ...}) — см. send_rich_blocks."""
-    payload = {"chat_id": chat_id, "message_id": message_id, "rich_message": {"blocks": blocks}}
-    if reply_markup is not None:
-        payload["reply_markup"] = reply_markup.to_dict() if hasattr(reply_markup, "to_dict") else reply_markup
-    data = await _rich_api_call("editMessageText", payload)
-    if data.get("ok"):
-        return True
-    if "message is not modified" in str(data.get("description", "")).lower():
-        return True
-    logging.info(f"editMessageText(blocks) недоступен, нужен откат на markdown: {data.get('description')}")
-    return False
-
-
 async def send_rich_message(chat_id, markdown_text: str, reply_markup=None, disabled_callbacks=None, force_reply: bool = False):
     """sendRichMessage — возвращает message_id при успехе, иначе None.
     markdown_text приходит в диалекте MarkdownV2 (как везде в файле) и
@@ -1322,7 +1207,13 @@ async def send_rich_or_plain(bot, chat_id, text: str, parse_mode: str = 'Markdow
     """
     if RICH_MESSAGES_ENABLED and parse_mode in ('MarkdownV2', 'HTML'):
         payload = {"chat_id": chat_id}
-        payload["rich_message"] = {"markdown": markdownv2_to_rich_markdown(text)} if parse_mode == 'MarkdownV2' else {"html": text}
+        if parse_mode == 'MarkdownV2':
+            payload["rich_message"] = {"markdown": markdownv2_to_rich_markdown(text)}
+        else:
+            # В rich-html нет атрибута expandable у <blockquote> (есть только
+            # <details>), поэтому убираем его — иначе уведомление откатится
+            # на обычный HTML-путь из-за неизвестного атрибута.
+            payload["rich_message"] = {"html": text.replace("<blockquote expandable>", "<blockquote>")}
         if reply_markup is not None:
             payload["reply_markup"] = reply_markup.to_dict()
         data = await _rich_api_call("sendRichMessage", payload)
@@ -1347,79 +1238,111 @@ async def send_rich_or_plain(bot, chat_id, text: str, parse_mode: str = 'Markdow
 # id последнего экрана-меню в user_data['screen_msg_id'], и любое
 # обновление экрана идёт через edit, а не через новое сообщение.
 
+async def send_screen(context: ContextTypes.DEFAULT_TYPE, chat_id, text: str,
+                      reply_markup=None, parse_mode='MarkdownV2',
+                      disabled_callbacks=None, force_reply: bool = False):
+    """
+    Отправляет НОВОЕ сообщение-экран, отдавая приоритет Rich Message
+    (sendRichMessage, Bot API 10.1+), и запоминает состояние экрана в
+    user_data (screen_msg_id / screen_is_rich / screen_force_reply).
+    Возвращает message_id отправленного сообщения.
+    """
+    want_rich = RICH_MESSAGES_ENABLED and parse_mode == 'MarkdownV2'
+    if want_rich:
+        msg_id = await send_rich_message(chat_id, text, reply_markup, disabled_callbacks, force_reply)
+        if msg_id is not None:
+            context.user_data['screen_msg_id'] = msg_id
+            context.user_data['screen_is_rich'] = True
+            context.user_data['screen_force_reply'] = bool(force_reply)
+            return msg_id
+
+    sent = await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode, reply_markup=reply_markup)
+    context.user_data['screen_msg_id'] = sent.message_id
+    context.user_data['screen_is_rich'] = False
+    context.user_data['screen_force_reply'] = False
+    return sent.message_id
+
+
 async def show_screen(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
                        reply_markup=None, parse_mode='MarkdownV2', disabled_callbacks=None,
                        force_reply: bool = False):
     """
-    Показывает "экран" — либо редактируя предыдущее меню-сообщение
-    этого пользователя, либо создавая новое, если редактировать нечего.
+    Показывает "экран" — редактируя предыдущее сообщение-меню этого
+    пользователя, либо отправляя новое, если редактировать нечего.
     Работает как из callback_query, так и из обычного текстового апдейта.
 
-    Сначала пытается отрендерить экран как Rich Message (Bot API 10.1+,
-    см. send_rich_message/edit_rich_message) — это даёт нативный "рич"-вид
-    без изменения текста самих экранов, поскольку он уже подготовлен как
-    валидный MarkdownV2 (esc()/quote()/header() и т.д. — тот же синтаксис
-    формата используется и внутри rich_message). Если рич-вызов недоступен
-    или падает по любой причине — тихо откатывается на обычный sendMessage/
-    editMessageText, поведение не меняется для пользователя.
+    Rich-путь (sendRichMessage/editMessageText с rich_message, Bot API 10.1+)
+    используется для MarkdownV2-экранов при включённом RICH_MESSAGES_ENABLED;
+    при любой ошибке тихо откатываемся на обычный sendMessage/editMessageText.
 
-    disabled_callbacks — необязательное множество callback_data, которые
-    нужно показать "притушенными" (DisabledButton, Bot API 10.3); работает
-    только на rich-пути, на обычном откате кнопка остаётся как есть.
+    "Режим" экрана (rich/plain и значение force_reply) запоминается в
+    user_data. Если новому экрану нужен другой режим, чем у текущего
+    сообщения, старое сообщение заменяется новым: Telegram не позволяет
+    при edit сменить тип сообщения (text <-> rich) или значение force_reply,
+    поэтому без этой проверки rich-экраны "застревали" бы в обычном
+    MarkdownV2 после первого же экрана, отправленного через reply_text.
 
-    force_reply — просит клиент сразу открыть текстовый ввод для этого
-    экрана (force_reply в InlineKeyboardMarkup/ReplyKeyboardMarkup,
-    Bot API 10.3); удобно на экранах "введите название/причину/ответ"
-    (create_link, banning_user, reply_ и т.д.). Тоже только rich-путь —
-    на fallback просто не показывается, поведение не ломается.
+    disabled_callbacks — множество callback_data, которые нужно показать
+    "притушенными" (disabled, Bot API 10.3); работает только на rich-пути,
+    на обычном откате кнопка остаётся кликабельной.
+    force_reply — просит клиент сразу открыть текстовый ввод (force_reply,
+    Bot API 10.3); тоже только rich-путь.
     """
     chat_id = update.effective_chat.id
-    msg_id = context.user_data.get('screen_msg_id')
-    use_rich = RICH_MESSAGES_ENABLED and parse_mode == 'MarkdownV2'
+    want_rich = RICH_MESSAGES_ENABLED and parse_mode == 'MarkdownV2'
 
     query = update.callback_query
-    if query:
-        if use_rich and await edit_rich_message(chat_id, query.message.message_id, text, reply_markup, disabled_callbacks, force_reply):
-            context.user_data['screen_msg_id'] = query.message.message_id
-            return
-        try:
-            await query.edit_message_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
-            context.user_data['screen_msg_id'] = query.message.message_id
-            return
-        except BadRequest as e:
-            if "Message is not modified" in str(e):
-                context.user_data['screen_msg_id'] = query.message.message_id
-                return
-            # сообщение могло быть удалено — упадём в общий путь ниже
-        except TelegramError as e:
-            logging.error(f"Ошибка edit (callback): {e}")
+    edit_msg_id = (query.message.message_id
+                   if query is not None and query.message is not None
+                   else context.user_data.get('screen_msg_id'))
 
-    if msg_id:
-        if use_rich and await edit_rich_message(chat_id, msg_id, text, reply_markup, disabled_callbacks, force_reply):
-            context.user_data['screen_msg_id'] = msg_id
-            return
-        try:
-            sent = await context.bot.edit_message_text(
-                chat_id=chat_id, message_id=msg_id, text=text,
-                parse_mode=parse_mode, reply_markup=reply_markup
-            )
-            context.user_data['screen_msg_id'] = msg_id
-            return
-        except BadRequest as e:
-            if "Message is not modified" in str(e):
-                return
-            # сообщение удалено/недоступно — отправим новое ниже
-        except TelegramError as e:
-            logging.error(f"Ошибка edit (по id): {e}")
+    current_rich = bool(context.user_data.get('screen_is_rich', False))
+    current_fr = bool(context.user_data.get('screen_force_reply', False))
 
-    if use_rich:
-        rich_msg_id = await send_rich_message(chat_id, text, reply_markup, disabled_callbacks, force_reply)
-        if rich_msg_id is not None:
-            context.user_data['screen_msg_id'] = rich_msg_id
-            return
+    # 1. Пробуем отредактировать текущее сообщение, если его режим совпадает
+    #    с требуемым (rich <-> rich, plain <-> plain, force_reply неизменен).
+    if edit_msg_id:
+        same_mode = (current_rich == want_rich)
+        same_fr = (bool(force_reply) == current_fr) if want_rich else True
 
-    sent = await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode, reply_markup=reply_markup)
-    context.user_data['screen_msg_id'] = sent.message_id
+        if same_mode and same_fr:
+            if want_rich:
+                if await edit_rich_message(chat_id, edit_msg_id, text, reply_markup, disabled_callbacks, force_reply):
+                    context.user_data['screen_msg_id'] = edit_msg_id
+                    context.user_data['screen_is_rich'] = True
+                    context.user_data['screen_force_reply'] = bool(force_reply)
+                    return
+            else:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id, message_id=edit_msg_id,
+                        text=text, parse_mode=parse_mode, reply_markup=reply_markup
+                    )
+                    context.user_data['screen_msg_id'] = edit_msg_id
+                    context.user_data['screen_is_rich'] = False
+                    context.user_data['screen_force_reply'] = False
+                    return
+                except BadRequest as e:
+                    if "Message is not modified" in str(e):
+                        context.user_data['screen_msg_id'] = edit_msg_id
+                        context.user_data['screen_is_rich'] = False
+                        context.user_data['screen_force_reply'] = False
+                        return
+                except TelegramError as e:
+                    logging.error(f"Ошибка edit (по id): {e}")
+
+        # Режим сменился или edit не прошёл — убираем старое сообщение, чтобы
+        # не оставлять его висеть поверх нового (не плодить экраны).
+        if context.user_data.get('screen_msg_id') == edit_msg_id:
+            try:
+                await context.bot.delete_message(chat_id=chat_id, message_id=edit_msg_id)
+            except Exception:
+                pass
+        context.user_data.pop('screen_msg_id', None)
+
+    # 2. Отправляем новый экран.
+    await send_screen(context, chat_id, text, reply_markup, parse_mode,
+                      disabled_callbacks=disabled_callbacks, force_reply=force_reply)
 
 
 FLOW_KEYS = (
@@ -1514,7 +1437,9 @@ def admin_econ_keyboard():
 
 def econ_user_picker_keyboard(action, page, users):
     """Клавиатура выбора пользователя для начисления/списания, с листанием
-    страниц — список пользователей может быть большим."""
+    страниц — список пользователей может быть большим. Кнопки «Пред.»/«След.»
+    всегда видны, а недоступная помечается disabled (Bot API 10.3), вместо
+    того чтобы пропадать из разметки. Возвращает (keyboard, disabled_callbacks)."""
     total = len(users)
     start = page * ECON_PAGE_SIZE
     page_users = users[start:start + ECON_PAGE_SIZE]
@@ -1526,35 +1451,46 @@ def econ_user_picker_keyboard(action, page, users):
             f"{SYM['id']} {label}"[:32],
             callback_data=f"admin_econ_user_{action}_{u[0]}_{page}"
         )])
-    nav_row = []
-    if page > 0:
-        nav_row.append(InlineKeyboardButton(f"{SYM['back']} Пред.", callback_data=f"admin_econ_pick_{action}_{page - 1}"))
-    if start + ECON_PAGE_SIZE < total:
-        nav_row.append(InlineKeyboardButton(f"След. {SYM['arrow']}", callback_data=f"admin_econ_pick_{action}_{page + 1}"))
-    if nav_row:
-        rows.append(nav_row)
+
+    disabled = set()
+    if total > ECON_PAGE_SIZE:
+        prev_cb = f"admin_econ_pick_{action}_{page - 1}"
+        next_cb = f"admin_econ_pick_{action}_{page + 1}"
+        rows.append([
+            InlineKeyboardButton(f"{SYM['back']} Пред.", callback_data=prev_cb),
+            InlineKeyboardButton(f"След. {SYM['arrow']}", callback_data=next_cb),
+        ])
+        if page <= 0:
+            disabled.add(prev_cb)
+        if start + ECON_PAGE_SIZE >= total:
+            disabled.add(next_cb)
+
     rows.append([InlineKeyboardButton(f"{SYM['back']} Назад", callback_data="admin_econ_menu")])
-    return InlineKeyboardMarkup(rows)
+    return InlineKeyboardMarkup(rows), disabled
 
 
 def user_management_keyboard(user_id, is_banned=False):
-    ban_row = (
-        [InlineKeyboardButton(f"{SYM['unlock']} Разбанить", callback_data=f"admin_unban_user_{user_id}")]
-        if is_banned else
-        [InlineKeyboardButton(f"{SYM['ban']} Забанить", callback_data=f"admin_ban_user_{user_id}")]
-    )
+    """Клавиатура управления пользователем. «Забанить» и «Разбанить» видны
+    одновременно: недоступное действие помечается disabled (Bot API 10.3),
+    вместо того чтобы исчезать. Возвращает (keyboard, disabled_callbacks)."""
+    ban_cb = f"admin_ban_user_{user_id}"
+    unban_cb = f"admin_unban_user_{user_id}"
+    disabled = {ban_cb} if is_banned else {unban_cb}
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(f"{SYM['link']} Ссылки", callback_data=f"admin_user_links_{user_id}"),
             InlineKeyboardButton(f"{SYM['view']} Переписка", callback_data=f"admin_view_conversation_{user_id}")
         ],
-        ban_row,
+        [
+            InlineKeyboardButton(f"{SYM['ban']} Забанить", callback_data=ban_cb),
+            InlineKeyboardButton(f"{SYM['unlock']} Разбанить", callback_data=unban_cb),
+        ],
         [
             InlineKeyboardButton(f"{SYM['trash']} Удалить", callback_data=f"admin_delete_user_{user_id}"),
             InlineKeyboardButton(f"{SYM['write']} Написать", callback_data=f"admin_message_user_{user_id}")
         ],
         [InlineKeyboardButton(f"{SYM['back']} Назад", callback_data="admin_users")]
-    ])
+    ]), disabled
 
 
 def message_actions_keyboard(message_id):
@@ -1649,8 +1585,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"{quote_expandable(esc(link_info[3]))}\n\n"
                     f"Отправьте анонимное сообщение, ссылку или медиафайл{esc('.')}"
                 )
-                msg_id = await send_rich_or_plain(context.bot, update.effective_chat.id, text, 'MarkdownV2', back_to_main_keyboard())
-                context.user_data['screen_msg_id'] = msg_id
+                await send_screen(context, update.effective_chat.id, text, back_to_main_keyboard())
                 return
             else:
                 await update.message.reply_text(f"{SYM['warn']} Ссылка недействительна или больше не существует\\.", parse_mode='MarkdownV2')
@@ -1660,8 +1595,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             header("Анонимный Бот", SYM['menu']) + "\n\n"
             f"Создавайте ссылки для получения анонимных сообщений{esc('.')}"
         )
-        sent = await update.message.reply_text(text, reply_markup=main_keyboard(), parse_mode='MarkdownV2')
-        context.user_data['screen_msg_id'] = sent.message_id
+        await send_screen(context, update.effective_chat.id, text, main_keyboard())
     except Exception as e:
         logging.error(f"Ошибка в команде start: {e}")
         try:
@@ -1687,23 +1621,20 @@ async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if context.args and context.args[0] == ADMIN_PASSWORD:
                 context.user_data['admin_authenticated'] = True
-                sent = await update.effective_chat.send_message(
+                await send_screen(
+                    context, update.effective_chat.id,
                     header("Панель администратора", SYM['check']),
-                    reply_markup=admin_keyboard(),
-                    parse_mode='MarkdownV2'
+                    admin_keyboard()
                 )
-                context.user_data['screen_msg_id'] = sent.message_id
             else:
-                sent = await update.effective_chat.send_message(f"{SYM['lock']} *Доступ запрещён*", parse_mode='MarkdownV2')
-                context.user_data['screen_msg_id'] = sent.message_id
+                await send_screen(context, update.effective_chat.id, f"{SYM['lock']} *Доступ запрещён*")
             return
         else:
-            sent = await update.message.reply_text(
+            await send_screen(
+                context, update.effective_chat.id,
                 header("Панель администратора", SYM['gear']),
-                reply_markup=admin_keyboard(),
-                parse_mode='MarkdownV2'
+                admin_keyboard()
             )
-            context.user_data['screen_msg_id'] = sent.message_id
     except Exception as e:
         logging.error(f"Ошибка в команде admin: {e}")
         try:
@@ -1839,7 +1770,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         update, context,
                         f"{SYM['warn']} {reason}\\. Виолы возвращены на баланс\\.\n\n"
                         f"{SYM['id']} Введите другой уникальный ID \\(латиница, цифры, `_` `-`, 3\\-32 символа\\) или `-` для автогенерации:",
-                        cancel_keyboard()
+                        cancel_keyboard(),
+                        force_reply=True
                     )
                 else:
                     clear_flow_state(context)
@@ -1895,7 +1827,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             rest = data.replace("admin_econ_pick_", "")
             action, _, page_str = rest.rpartition("_")
-            page = safe_int(page_str, default=0) or 0
+            page = max(0, safe_int(page_str, default=0) or 0)
             if action not in ("give", "take"):
                 await query.answer("Ошибка", show_alert=True)
                 return
@@ -1905,7 +1837,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             action_label = "начисления" if action == "give" else "списания"
             text = header("Выберите пользователя", SYM['users']) + f"\n\nДля {action_label} виол:"
-            await show_screen(update, context, text, econ_user_picker_keyboard(action, page, users))
+            keyboard, disabled = econ_user_picker_keyboard(action, page, users)
+            await show_screen(update, context, text, keyboard, disabled_callbacks=disabled)
             return
 
         elif data.startswith("admin_econ_user_"):
@@ -1944,43 +1877,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if links:
                 bot_username = context.bot.username
                 back_row = [InlineKeyboardButton(f"{SYM['back']} Главное меню", callback_data="main_menu")]
-
-                # Пробуем встроить кнопку "Управлять" сразу под описанием
-                # каждой ссылки (RichBlockButtons, Bot API 10.3) — вместо
-                # одной общей клавиатуры, оторванной от текста, внизу
-                # экрана. Экспериментально: если Bot API ещё не принимает
-                # такой blocks-запрос, тихо откатываемся на прежний вид
-                # (общий флэт-список кнопок под текстом), см. rich_buttons_block.
-                if RICH_MESSAGES_ENABLED:
-                    blocks = [{"type": "heading", "text": "Ваши анонимные ссылки", "size": 2}]
-                    for link in links:
-                        link_url = f"https://t.me/{bot_username}?start={link[0]}"
-                        created = format_datetime(link[3])
-                        is_sponsor = len(link) > 4 and link[4]
-                        title = ("🎁 СПОНСОРСКАЯ · " if is_sponsor else "") + link[1]
-                        blocks.append(rich_heading(title, size=4))
-                        blocks.append(rich_paragraph(link[2]))
-                        blocks.append(rich_paragraph(link_url))
-                        blocks.append(rich_paragraph(f"Создана: {created}"))
-                        blocks.append(rich_buttons_block([[rich_button(f"{SYM['gear']} Управлять", callback_data=f"link_manage_{link[0]}")]]))
-                    msg_id = context.user_data.get('screen_msg_id')
-                    ok = False
-                    if update.callback_query:
-                        ok = await edit_rich_blocks(update.effective_chat.id, update.callback_query.message.message_id, blocks, InlineKeyboardMarkup([back_row]))
-                        if ok:
-                            context.user_data['screen_msg_id'] = update.callback_query.message.message_id
-                    elif msg_id:
-                        ok = await edit_rich_blocks(update.effective_chat.id, msg_id, blocks, InlineKeyboardMarkup([back_row]))
-                        if ok:
-                            context.user_data['screen_msg_id'] = msg_id
-                    if not ok:
-                        new_id = await send_rich_blocks(update.effective_chat.id, blocks, InlineKeyboardMarkup([back_row]))
-                        if new_id is not None:
-                            context.user_data['screen_msg_id'] = new_id
-                            ok = True
-                    if ok:
-                        return
-                    # blocks-режим недоступен — падаем в проверенный markdown-путь ниже
 
                 text = header("Ваши анонимные ссылки", SYM['link']) + "\n\n"
                 flat_buttons = []
@@ -2045,7 +1941,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await show_screen(
                     update, context,
                     f"{SYM['write']} Введите {field_label} для ссылки:",
-                    InlineKeyboardMarkup([[InlineKeyboardButton(f"{SYM['cancel']} Отмена", callback_data=cancel_cb)]])
+                    InlineKeyboardMarkup([[InlineKeyboardButton(f"{SYM['cancel']} Отмена", callback_data=cancel_cb)]]),
+                    force_reply=True
                 )
             else:
                 await query.answer(f"{SYM['lock']} Нет доступа к этой ссылке", show_alert=True)
@@ -2287,7 +2184,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"Имя: {esc(user_display)}\n"
                         f"Статус: {status}"
                     )
-                    await show_screen(update, context, text, user_management_keyboard(user_id, bool(is_banned)))
+                    keyboard, disabled = user_management_keyboard(user_id, bool(is_banned))
+                    await show_screen(update, context, text, keyboard, disabled_callbacks=disabled)
                 else:
                     await query.answer("Пользователь не найден", show_alert=True)
                 return
@@ -2298,7 +2196,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await show_screen(
                     update, context,
                     f"{SYM['ban']} *Блокировка пользователя* `{user_id}`\n\nВведите причину блокировки:",
-                    InlineKeyboardMarkup([[InlineKeyboardButton(f"{SYM['cancel']} Отмена", callback_data=f"admin_user_manage_{user_id}")]])
+                    InlineKeyboardMarkup([[InlineKeyboardButton(f"{SYM['cancel']} Отмена", callback_data=f"admin_user_manage_{user_id}")]]),
+                    force_reply=True
                 )
                 return
 
@@ -2317,7 +2216,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         notice_delivered = False
                         logging.error(f"Не удалось уведомить пользователя {user_id} о разбане: {e}")
                     delivery_note = "" if notice_delivered else f"\n{SYM['warn']} Уведомление не доставлено \\(бот заблокирован пользователем\\)"
-                    await show_screen(update, context, f"{SYM['check']} Пользователь `{user_id}` разблокирован{esc('!')}{delivery_note}", user_management_keyboard(user_id, False))
+                    keyboard, disabled = user_management_keyboard(user_id, False)
+                    await show_screen(update, context, f"{SYM['check']} Пользователь `{user_id}` разблокирован{esc('!')}{delivery_note}", keyboard, disabled_callbacks=disabled)
                 else:
                     await query.answer("Ошибка при разблокировке", show_alert=True)
                 return
@@ -2358,7 +2258,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await show_screen(
                     update, context,
                     f"{SYM['write']} *Сообщение пользователю* `{user_id}`\n\nВведите текст:",
-                    InlineKeyboardMarkup([[InlineKeyboardButton(f"{SYM['cancel']} Отмена", callback_data=f"admin_user_manage_{user_id}")]])
+                    InlineKeyboardMarkup([[InlineKeyboardButton(f"{SYM['cancel']} Отмена", callback_data=f"admin_user_manage_{user_id}")]]),
+                    force_reply=True
                 )
                 return
 
@@ -2376,7 +2277,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await show_screen(
                     update, context,
                     header("Создание спонсорской ссылки", SYM['gift']) + "\n\nВведите *название*:",
-                    InlineKeyboardMarkup([[InlineKeyboardButton(f"{SYM['cancel']} Отмена", callback_data="admin_sponsor_links")]])
+                    InlineKeyboardMarkup([[InlineKeyboardButton(f"{SYM['cancel']} Отмена", callback_data="admin_sponsor_links")]]),
+                    force_reply=True
                 )
                 return
 
@@ -2425,7 +2327,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await show_screen(
                     update, context,
                     header("Передача спонсорской ссылки", SYM['transfer']) + "\n\nВведите *ID пользователя*:",
-                    InlineKeyboardMarkup([[InlineKeyboardButton(f"{SYM['cancel']} Отмена", callback_data=f"admin_sponsor_actions_{link_id}")]])
+                    InlineKeyboardMarkup([[InlineKeyboardButton(f"{SYM['cancel']} Отмена", callback_data=f"admin_sponsor_actions_{link_id}")]]),
+                    force_reply=True
                 )
                 return
 
@@ -2467,7 +2370,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await show_screen(
                     update, context,
                     header("Режим рассылки", SYM['broadcast']) + "\n\nВведите сообщение для рассылки всем пользователям:",
-                    broadcast_formatting_keyboard()
+                    broadcast_formatting_keyboard(),
+                    force_reply=True
                 )
                 return
 
@@ -2534,7 +2438,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await show_screen(
                     update, context,
                     f"{SYM['write']} Введите *текст кнопки*:",
-                    InlineKeyboardMarkup([[InlineKeyboardButton(f"{SYM['cancel']} Отмена", callback_data="btn_add_cancel")]])
+                    InlineKeyboardMarkup([[InlineKeyboardButton(f"{SYM['cancel']} Отмена", callback_data="btn_add_cancel")]]),
+                    force_reply=True
                 )
                 return
 
@@ -2616,7 +2521,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     keyboard = InlineKeyboardMarkup(keyboard_buttons)
                     await show_screen(update, context, text, keyboard)
                 else:
-                    await show_screen(update, context, f"У пользователя нет ссылок{esc('.')}", user_management_keyboard(user_id))
+                    keyboard, disabled = user_management_keyboard(user_id)
+                    await show_screen(update, context, f"У пользователя нет ссылок{esc('.')}", keyboard, disabled_callbacks=disabled)
                 return
 
             elif data.startswith("admin_view_conversation_"):
@@ -2635,7 +2541,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         caption=f"{SYM['view']} Переписка пользователя {user_id}"
                     )
 
-                await show_screen(update, context, f"{SYM['check']} Отчёт переписки отправлен{esc('!')}", user_management_keyboard(user_id))
+                keyboard, disabled = user_management_keyboard(user_id)
+                await show_screen(update, context, f"{SYM['check']} Отчёт переписки отправлен{esc('!')}", keyboard, disabled_callbacks=disabled)
                 return
 
             elif data.startswith("admin_link_conv_"):
@@ -2712,7 +2619,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if context.user_data.get('btn_stage') == 'label':
             label = text.strip()[:64]
             if not label:
-                await show_screen(update, context, f"{SYM['warn']} Текст кнопки не может быть пустым{esc('.')} Введите текст кнопки:", InlineKeyboardMarkup([[InlineKeyboardButton(f"{SYM['cancel']} Отмена", callback_data="btn_add_cancel")]]))
+                await show_screen(
+                    update, context,
+                    f"{SYM['warn']} Текст кнопки не может быть пустым{esc('.')} Введите текст кнопки:",
+                    InlineKeyboardMarkup([[InlineKeyboardButton(f"{SYM['cancel']} Отмена", callback_data="btn_add_cancel")]]),
+                    force_reply=True
+                )
                 return
             context.user_data['btn_pending_label'] = label
             context.user_data['btn_stage'] = 'url'
@@ -2720,7 +2632,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 update, context,
                 f"{SYM['link']} Введите *ссылку* для кнопки «{esc(label)}»:\n\n"
                 f"{SYM['dot']} Например: `https://t.me/channel`",
-                InlineKeyboardMarkup([[InlineKeyboardButton(f"{SYM['cancel']} Отмена", callback_data="btn_add_cancel")]])
+                InlineKeyboardMarkup([[InlineKeyboardButton(f"{SYM['cancel']} Отмена", callback_data="btn_add_cancel")]]),
+                force_reply=True
             )
             return
 
@@ -2771,7 +2684,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await show_screen(
                     update, context,
                     f"{SYM['warn']} Сумма должна быть положительным целым числом\\. Введите ещё раз:",
-                    InlineKeyboardMarkup([[InlineKeyboardButton(f"{SYM['cancel']} Отмена", callback_data="admin_econ_menu")]])
+                    InlineKeyboardMarkup([[InlineKeyboardButton(f"{SYM['cancel']} Отмена", callback_data="admin_econ_menu")]]),
+                    force_reply=True
                 )
                 return
 
@@ -2866,20 +2780,27 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # ─── Передача спонсорской ссылки ───
         if context.user_data.get('transferring_sponsor_link'):
-            link_id = context.user_data.pop('transferring_sponsor_link')
+            link_id = context.user_data.get('transferring_sponsor_link')
             try:
                 new_user_id = int(text)
-                success = transfer_sponsor_link(link_id, new_user_id)
-                if success:
-                    await show_screen(
-                        update, context,
-                        f"{SYM['check']} Спонсорская ссылка передана пользователю `{new_user_id}`{esc('!')}",
-                        sponsor_links_keyboard()
-                    )
-                else:
-                    await show_screen(update, context, f"{SYM['warn']} Ошибка при передаче ссылки", sponsor_links_keyboard())
             except ValueError:
-                await show_screen(update, context, f"{SYM['warn']} Неверный формат ID{esc('.')} Введите числовой ID{esc('.')}", sponsor_links_keyboard())
+                await show_screen(
+                    update, context,
+                    f"{SYM['warn']} Неверный формат ID{esc('.')} Введите числовой ID{esc('.')}",
+                    sponsor_links_keyboard(),
+                    force_reply=True
+                )
+                return
+            context.user_data.pop('transferring_sponsor_link', None)
+            success = transfer_sponsor_link(link_id, new_user_id)
+            if success:
+                await show_screen(
+                    update, context,
+                    f"{SYM['check']} Спонсорская ссылка передана пользователю `{new_user_id}`{esc('!')}",
+                    sponsor_links_keyboard()
+                )
+            else:
+                await show_screen(update, context, f"{SYM['warn']} Ошибка при передаче ссылки", sponsor_links_keyboard())
             return
 
         # ─── Создание спонсорской ссылки (пошагово) ───
@@ -2892,7 +2813,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await show_screen(
                     update, context,
                     f"{SYM['write']} Введите *описание* для спонсорской ссылки:",
-                    InlineKeyboardMarkup([[InlineKeyboardButton(f"{SYM['cancel']} Отмена", callback_data="admin_sponsor_links")]])
+                    InlineKeyboardMarkup([[InlineKeyboardButton(f"{SYM['cancel']} Отмена", callback_data="admin_sponsor_links")]]),
+                    force_reply=True
                 )
             elif stage == 'description':
                 context.user_data['sponsor_description'] = text
@@ -2900,7 +2822,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await show_screen(
                     update, context,
                     f"{SYM['id']} Введите *кастомный ID* \\(или `-` для автогенерации\\):",
-                    InlineKeyboardMarkup([[InlineKeyboardButton(f"{SYM['cancel']} Отмена", callback_data="admin_sponsor_links")]])
+                    InlineKeyboardMarkup([[InlineKeyboardButton(f"{SYM['cancel']} Отмена", callback_data="admin_sponsor_links")]]),
+                    force_reply=True
                 )
             elif stage == 'custom_id':
                 custom_id = text.strip()
@@ -2915,7 +2838,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"{SYM['warn']} ID `{esc_code(custom_id[:40])}` не подходит{esc('.')}\n\n"
                         f"Разрешены только латинские буквы, цифры, `_` и `-`, длина 3\\-32 символа "
                         f"\\(без кириллицы, пробелов и эмодзи\\){esc('.')} Введите ID заново или `-` для автогенерации:",
-                        InlineKeyboardMarkup([[InlineKeyboardButton(f"{SYM['cancel']} Отмена", callback_data="admin_sponsor_links")]])
+                        InlineKeyboardMarkup([[InlineKeyboardButton(f"{SYM['cancel']} Отмена", callback_data="admin_sponsor_links")]]),
+                        force_reply=True
                     )
                     return
                 context.user_data['sponsor_custom_id'] = custom_id
@@ -2923,42 +2847,49 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await show_screen(
                     update, context,
                     f"{SYM['target']} Введите *ID пользователя* \\(или 0 без привязки\\):",
-                    InlineKeyboardMarkup([[InlineKeyboardButton(f"{SYM['cancel']} Отмена", callback_data="admin_sponsor_links")]])
+                    InlineKeyboardMarkup([[InlineKeyboardButton(f"{SYM['cancel']} Отмена", callback_data="admin_sponsor_links")]]),
+                    force_reply=True
                 )
             elif stage == 'target_user':
+                try:
+                    target_user_id = int(text) if text != '0' else None
+                except ValueError:
+                    await show_screen(
+                        update, context,
+                        f"{SYM['warn']} Неверный формат ID{esc('.')} Введите число или 0{esc('.')}",
+                        sponsor_links_keyboard(),
+                        force_reply=True
+                    )
+                    return
                 title = context.user_data.pop('sponsor_title')
                 description = context.user_data.pop('sponsor_description')
                 custom_id = context.user_data.pop('sponsor_custom_id', None)
                 context.user_data.pop('creating_sponsor_link')
                 context.user_data.pop('sponsor_stage')
 
-                try:
-                    target_user_id = int(text) if text != '0' else None
-                    link_id = create_sponsor_link(user.id, title, description, target_user_id, custom_id)
+                link_id = create_sponsor_link(user.id, title, description, target_user_id, custom_id)
 
-                    if link_id is None:
-                        reason = "Кастомный ID уже занят" if custom_id else "Не удалось сохранить ссылку в базе данных"
-                        await show_screen(
-                            update, context,
-                            f"{SYM['warn']} {reason}{esc('!')} Попробуйте снова{esc('.')}",
-                            sponsor_links_keyboard()
-                        )
-                        return
-
-                    bot_username = context.bot.username
-                    link_url = f"https://t.me/{bot_username}?start={link_id}"
-                    custom_info = f"\nID: `{esc_code(custom_id)}`" if custom_id else ""
-
+                if link_id is None:
+                    reason = "Кастомный ID уже занят" if custom_id else "Не удалось сохранить ссылку в базе данных"
                     await show_screen(
                         update, context,
-                        header("Спонсорская ссылка создана!", SYM['check']) + "\n\n"
-                        f"*{esc(title)}*\n{esc(description)}\n"
-                        f"Владелец: `{target_user_id or 'не назначен'}`{custom_info}\n\n"
-                        f"`{esc_code(link_url)}`",
+                        f"{SYM['warn']} {reason}{esc('!')} Попробуйте снова{esc('.')}",
                         sponsor_links_keyboard()
                     )
-                except ValueError:
-                    await show_screen(update, context, f"{SYM['warn']} Неверный формат ID{esc('.')} Введите число или 0{esc('.')}", sponsor_links_keyboard())
+                    return
+
+                bot_username = context.bot.username
+                link_url = f"https://t.me/{bot_username}?start={link_id}"
+                custom_info = f"\nID: `{esc_code(custom_id)}`" if custom_id else ""
+
+                await show_screen(
+                    update, context,
+                    header("Спонсорская ссылка создана!", SYM['check']) + "\n\n"
+                    f"*{esc(title)}*\n{esc(description)}\n"
+                    f"Владелец: `{target_user_id or 'не назначен'}`{custom_info}\n\n"
+                    f"`{esc_code(link_url)}`",
+                    sponsor_links_keyboard()
+                )
             return
 
         # ─── Ответ на сообщение (в т.ч. на сообщения-ссылки — раньше ломалось
@@ -3006,7 +2937,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if stage == 'title':
                 context.user_data['link_title'] = text
                 context.user_data['link_stage'] = 'description'
-                await show_screen(update, context, f"{SYM['write']} Теперь введите *описание* для ссылки:", cancel_keyboard())
+                await show_screen(update, context, f"{SYM['write']} Теперь введите *описание* для ссылки:", cancel_keyboard(), force_reply=True)
 
             elif stage == 'description':
                 title = context.user_data.get('link_title')
@@ -3035,7 +2966,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     update, context,
                     f"{SYM['id']} Введите *уникальный ID* для ссылки\n"
                     f"Латиница, цифры, `_` и `-`, 3\\-32 символа — или `-` для автогенерации:",
-                    cancel_keyboard()
+                    cancel_keyboard(),
+                    force_reply=True
                 )
 
             elif stage == 'custom_id':
@@ -3048,7 +2980,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"{SYM['warn']} ID `{esc_code(custom_id[:40])}` не подходит{esc('.')}\n\n"
                         f"Разрешены только латинские буквы, цифры, `_` и `-`, длина 3\\-32 символа "
                         f"\\(без кириллицы, пробелов и эмодзи\\){esc('.')} Введите ID заново или `-` для автогенерации:",
-                        cancel_keyboard()
+                        cancel_keyboard(),
+                        force_reply=True
                     )
                     return
                 context.user_data['link_custom_id'] = custom_id
