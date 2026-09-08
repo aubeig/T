@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 270" width="420" height="270">
+  <defs>
+    <linearGradient id="lux" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#2D0B4E"/><stop offset="40%" stop-color="#7B1FA2"/><stop offset="100%" stop-color="#00BCD4"/></linearGradient>
+    <radialGradient id="orchid" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.95"/><stop offset="50%" stop-color="#E1F5FE" stop-opacity="0.3"/><stop offset="100%" stop-color="#2D0B4E" stop-opacity="0"/></radialGradient>
+    <filter id="glow"><feDropShadow dx="0" dy="10" stdDeviation="14" flood-color="#7B1FA2" flood-opacity="0.35"/></filter>
+  </defs>
+  <rect x="14" y="14" width="392" height="242" rx="26" ry="26" fill="#0B0B12" stroke="#2A1045" stroke-width="1" filter="url(#glow)"/>
+  <ellipse cx="360" cy="60" rx="100" ry="65" fill="url(#orchid)" opacity="0.9"/>
+  <circle cx="360" cy="60" r="28" fill="#FFFFFF"/>
+  <polygon points="360,42 367,58 360,72 353,58" fill="#0B0B12" opacity="0.9"/>
+
+  <text x="100" y="68" font-family="system-ui,sans-serif" font-weight="800" font-size="16" fill="#F0F0F8">VIOLET BANK</text>
+  <text x="100" y="86" font-family="system-ui,sans-serif" font-weight="400" font-size="10" fill="#8A8A9A" letter-spacing="2">БАЛАНС · ДЕРЕВО</text>
+
+  <g font-family="system-ui,sans-serif" font-weight="700" font-size="14" fill="#D8D8E8">
+    <text x="36" y="122" fill="#00BCD4">├─</text><text x="80" y="122">◆  НИК</text><text x="240" y="122" fill="#fff">@user</text>
+    <text x="36" y="152" fill="#7B1FA2">├─</text><text x="80" y="152">◇  СТАТУС</text><text x="240" y="152" fill="#FFD24A">Золотой</text>
+    <text x="36" y="182" fill="#00BCD4">├─</text><text x="80" y="182">◎  БАЛАНС</text><text x="240" y="182" font-weight="900" fill="#fff" font-size="18">12 480</text><text x="340" y="182" fill="#888899" font-size="12">Viol</text>
+    <text x="36" y="212" fill="#FFD24A">└─</text><text x="80" y="212">✦  УКРАШЕНИЕ</text><text x="240" y="212" fill="#7B1FA2">Кристалл Небес</text>
+  </g>
+
+  <text x="210" y="238" text-anchor="middle" font-family="system-ui,sans-serif" font-weight="900" font-size="26" fill="url(#lux)">12 480 Viol</text>
+  <rect x="30" y="250" width="360" height="3" rx="1.5" fill="url(#lux)" opacity="0.8"/>
+</svg>

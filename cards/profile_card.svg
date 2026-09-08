@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 250" width="420" height="250">
+  <defs>
+    <linearGradient id="lux" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#2D0B4E"/><stop offset="40%" stop-color="#5E1A8A"/><stop offset="100%" stop-color="#00BCD4"/></linearGradient>
+    <radialGradient id="orchid" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.95"/><stop offset="40%" stop-color="#B3E5FC" stop-opacity="0.6"/><stop offset="100%" stop-color="#4A148C" stop-opacity="0"/></radialGradient>
+    <filter id="softGlow"><feGaussianBlur in="SourceGraphic" stdDeviation="10" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+  </defs>
+
+  <!-- Main floating card with unusual rounded shape -->
+  <rect x="10" y="10" width="400" height="230" rx="28" ry="28" fill="#0B0B12" stroke="#2A1045" stroke-width="1.5"/>
+
+  <!-- Large floating orb (your Viol icon style) top-right -->
+  <circle cx="350" cy="70" r="55" fill="url(#orchid)" filter="url(#softGlow)"/>
+  <circle cx="350" cy="70" r="22" fill="#FFFFFF" opacity="0.9"/>
+  <polygon points="350,52 356,68 350,80 344,68" fill="#0B0B12" opacity="0.85"/>
+
+  <!-- Elegant left vertical accent -->
+  <rect x="20" y="40" width="3" height="140" rx="1.5" fill="url(#lux)" opacity="0.7"/>
+
+  <!-- Title area -->
+  <text x="60" y="72" font-family="system-ui, sans-serif" font-weight="800" font-size="22" fill="#F0F0F8" letter-spacing="-0.5">VIOLET BANK</text>
+  <text x="60" y="92" font-family="system-ui, sans-serif" font-weight="400" font-size="10" fill="#8A8A9A" letter-spacing="3">ПРОФИЛЬ · МАТЕРИАЛ YOU EXPENSIVE</text>
+
+  <!-- Glass info panel (unusual rounded rectangle) -->
+  <rect x="60" y="110" width="310" height="100" rx="18" ry="18" fill="rgba(255,255,255,0.03)" stroke="rgba(255,255,255,0.08)" stroke-width="1"/>
+
+  <text x="80" y="138" font-family="system-ui, sans-serif" font-weight="700" font-size="13" fill="#B0B0C8">◆  НИК</text>
+  <text x="80" y="158" font-family="system-ui, sans-serif" font-weight="600" font-size="13" fill="#EAEAEA">@user</text>
+
+  <text x="80" y="180" font-family="system-ui, sans-serif" font-weight="700" font-size="13" fill="#B0B0C8">◇  СТАТУС</text>
+  <text x="200" y="180" font-family="system-ui, sans-serif" font-weight="600" font-size="13" fill="#00BCD4">Золотой</text>
+
+  <text x="80" y="202" font-family="system-ui, sans-serif" font-weight="700" font-size="13" fill="#B0B0C8">◎  БАЛАНС</text>
+  <text x="200" y="202" font-family="system-ui, sans-serif" font-weight="800" font-size="16" fill="#F5F5FA">12 480</text>
+  <text x="270" y="202" font-family="system-ui, sans-serif" font-weight="500" font-size="11" fill="#888899">Viol</text>
+
+  <text x="80" y="222" font-family="system-ui, sans-serif" font-weight="700" font-size="13" fill="#B0B0C8">✦  УКРАШЕНИЕ</text>
+  <text x="200" y="222" font-family="system-ui, sans-serif" font-weight="600" font-size="13" fill="#C5A8F5">Кристалл Небес</text>
+
+  <!-- Bottom decorative gradient line -->
+  <rect x="60" y="225" width="310" height="3" rx="1.5" fill="url(#lux)" opacity="0.6"/>
+</svg>

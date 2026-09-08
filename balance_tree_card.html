@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;500;700;900&display=swap');
+:root {
+  --bg:#0b0b14; --surface:rgba(255,255,255,0.03); --border:rgba(255,255,255,0.08);
+  --accent:#00F0FF; --accent2:#8A2BE2; --accent3:#FFD24A;
+  --text:#f0f0ff; --text-sec:#b0a8e8;
+  --radius:22px; --glow:rgba(112,0,255,0.35);
+}
+* { box-sizing:border-box; }
+body { background:var(--bg); margin:0; padding:24px; font-family:'Outfit',sans-serif; color:var(--text); }
+.card-wrapper { max-width:480px; margin:0 auto; }
+/* Material You expensive glass card */
+.glass-card {
+  background: linear-gradient(170deg, rgba(112,0,255,0.12) 0%, rgba(0,240,255,0.06) 60%, rgba(255,210,74,0.05) 100%);
+  backdrop-filter:blur(24px) saturate(140%); -webkit-backdrop-filter:blur(24px) saturate(140%);
+  border:1px solid rgba(255,255,255,0.10); border-radius:var(--radius); padding:28px 26px 32px;
+  box-shadow: 0 24px 60px rgba(112,0,255,0.18), 0 0 0 1px rgba(255,255,255,0.05) inset;
+  position:relative; overflow:hidden;
+}
+.glass-card::before {
+  content:''; position:absolute; top:-40%; left:-30%; width:160%; height:160%;
+  background:radial-gradient(circle at 30% 20%, rgba(0,240,255,0.18) 0%, transparent 60%),
+              radial-gradient(circle at 80% 80%, rgba(138,43,226,0.18) 0%, transparent 60%);
+  animation: orbDrift 12s ease-in-out infinite alternate;
+  pointer-events:none; z-index:0;
+}
+@keyframes orbDrift { from { transform: translate(0,0) rotate(0); } to { transform: translate(-4%,4%) rotate(2deg); } }
+
+/* Tree balance display — top to bottom progressive reveal */
+.tree { position:relative; z-index:1; padding-left:8px; }
+.tree-row {
+  display:flex; align-items:center; gap:14px; padding:10px 0; border-bottom:1px solid rgba(255,255,255,0.06);
+  animation: fadeSlideDown 0.7s ease both;
+  opacity:0; transform:translateY(-10px);
+}
+.tree-row:nth-child(1) { animation-delay:0.1s; }
+.tree-row:nth-child(2) { animation-delay:0.2s; }
+.tree-row:nth-child(3) { animation-delay:0.3s; }
+.tree-row:nth-child(4) { animation-delay:0.4s; }
+@keyframes fadeSlideDown { to { opacity:1; transform:translateY(0); } }
+
+.tree-branch { font-family:monospace; font-weight:700; color:var(--accent); font-size:1.1em; letter-spacing:2px; min-width:36px; }
+.tree-label { font-weight:500; color:var(--text-sec); font-size:0.92em; text-transform:uppercase; letter-spacing:1px; min-width:110px; }
+.tree-value { font-weight:800; font-size:1.05em; color:var(--text); text-shadow:0 0 14px rgba(0,240,255,0.25); }
+.tree-icon { width:32px; height:32px; border-radius:50%; display:grid; place-items:center; background:linear-gradient(135deg,rgba(112,0,255,0.25),rgba(0,240,255,0.15)); border:1px solid rgba(255,255,255,0.12); font-size:1em; flex-shrink:0; }
+
+/* Big balance number */
+.balance-hero { position:relative; z-index:1; margin-top:22px; padding-top:16px; border-top:1px solid rgba(255,255,255,0.08); text-align:center; }
+.balance-num { font-weight:900; font-size:3.6em; letter-spacing:-2px; line-height:1; background: linear-gradient(135deg, #00F0FF 0%, #8A2BE2 50%, #FFD24A 100%); -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; filter:drop-shadow(0 0 18px rgba(0,240,255,0.35)); animation: pulseGlow 3s ease-in-out infinite; }
+@keyframes pulseGlow { 0%,100%{ filter:drop-shadow(0 0 18px rgba(0,240,255,0.35)); } 50%{ filter:drop-shadow(0 0 30px rgba(138,43,226,0.6)); } }
+.balance-label { font-weight:700; color:var(--text-sec); font-size:0.85em; letter-spacing:2px; text-transform:uppercase; margin-top:6px; }
+
+/* Footer ornament */
+.ornament { display:flex; justify-content:center; gap:8px; margin-top:22px; opacity:0.9; }
+.ornament span { width:8px; height:8px; border-radius:50%; background:linear-gradient(135deg,var(--accent),var(--accent3)); box-shadow:0 0 10px var(--accent); animation: blink 2s infinite; }
+.ornament span:nth-child(2) { animation-delay:0.3s; }
+.ornament span:nth-child(3) { animation-delay:0.6s; }
+@keyframes blink { 0%,100%{ opacity:0.6; } 50%{ opacity:1; } }
+</style>
+</head>
+<body>
+<div class="card-wrapper">
+  <div class="glass-card">
+    <div style="position:relative;z-index:1;display:flex;align-items:center;gap:14px;margin-bottom:18px;">
+      <div style="width:52px;height:52px;border-radius:16px;background:linear-gradient(135deg,#7000FF,#00F0FF);display:grid;place-items:center;font-size:1.6em;box-shadow:0 0 20px rgba(112,0,255,0.4);">💎</div>
+      <div>
+        <div style="font-weight:900;font-size:1.3em;letter-spacing:0.5px;">Violet Bank</div>
+        <div style="font-size:0.78em;color:var(--text-sec);font-weight:600;">Баланс · Промо · Статус</div>
+      </div>
+    </div>
+
+    <div class="tree">
+      <div class="tree-row">
+        <div class="tree-branch">├─</div>
+        <div class="tree-icon">👤</div>
+        <div class="tree-label">Ник</div>
+        <div class="tree-value">@user_name</div>
+      </div>
+      <div class="tree-row">
+        <div class="tree-branch">├─</div>
+        <div class="tree-icon">🏆</div>
+        <div class="tree-label">Статус</div>
+        <div class="tree-value">Золотой спонсор</div>
+      </div>
+      <div class="tree-row">
+        <div class="tree-branch">├─</div>
+        <div class="tree-icon">💎</div>
+        <div class="tree-label">Баланс в Viol</div>
+        <div class="tree-value">+12 480</div>
+      </div>
+      <div class="tree-row">
+        <div class="tree-branch">└─</div>
+        <div class="tree-icon">✨</div>
+        <div class="tree-label">Украшение</div>
+        <div class="tree-value">Кристалл Небес</div>
+      </div>
+    </div>
+
+    <div class="balance-hero">
+      <div class="balance-num">12 480</div>
+      <div class="balance-label">Всего Viol</div>
+    </div>
+
+    <div class="ornament"><span></span><span></span><span></span></div>
+  </div>
+</div>
+</body>
+</html>

@@ -131,7 +131,7 @@ SYM = {
     "warn": "▲",
     "lock": "◈",
     "unlock": "◇",
-    "gear": "⚙",
+    "gear": "◆",
     "users": "▤",
     "stats": "▦",
     "gift": "◉",
@@ -1566,6 +1566,14 @@ def _salute_chat_targets() -> list:
     id самого бот-аккаунта Salute (личный чат = id собеседника).
     """
     targets = []
+    group_chat = os.environ.get("ASR_GROUP_CHAT_ID")
+    if group_chat:
+        try:
+            targets.append(int(group_chat))
+        except ValueError:
+            pass
+    if targets:
+        return targets
     if _asr_bridge.get("salute_chat_id"):
         targets.append(_asr_bridge["salute_chat_id"])
     if ASR_SALUTE_BOT_ID and ASR_SALUTE_BOT_ID not in targets:
@@ -1824,10 +1832,10 @@ async def _send_job_to_salute(context, job) -> bool:
         return False
     last_desc = ""
     for chat_id in targets:
-        fields = {
-            "chat_id": str(chat_id),
-            "business_connection_id": str(_asr_bridge["connection_id"]),
-        }
+        # РЕЖИМ 2: прямой чат с Салютой (без бизнес-моста)
+        fields = {"chat_id": str(chat_id)}
+        if _asr_bridge.get("connection_id") and _asr_bridge.get("enabled"):
+            fields["business_connection_id"] = str(_asr_bridge["connection_id"])
         r = await _bot_file_call(method, fields, field, data, name, mime)
         if r.get("ok"):
             if _asr_bridge["salute_chat_id"] != chat_id:
@@ -1890,7 +1898,10 @@ async def _cleanup_business_messages(context, job) -> None:
     """Подметаем за собой в business-чате (наш файл + служебные ответы Salute)."""
     cleanup = job.get("cleanup") or []
     conn_id = _asr_bridge.get("connection_id")
-    if not cleanup or not conn_id or not context:
+    # ЗАЩИТА: не удалять, если мост отключён или нет связи
+    if not cleanup or not conn_id or not context or not _asr_bridge.get("enabled"):
+        if cleanup and not _asr_bridge.get("enabled"):
+            logging.info("ASR-мост: пропускаю cleanup — мост отключён")
         return
     r = await _rich_api_call("deleteMessages", {
         "business_connection_id": str(conn_id),
@@ -1898,6 +1909,8 @@ async def _cleanup_business_messages(context, job) -> None:
     })
     if not r.get("ok"):
         logging.info(f"ASR-мост: не получилось подмести: {r.get('description')}")
+    else:
+        logging.info(f"ASR-мост: подмел {len(cleanup[:100])} сообщений в бизнес-чате")
     job["cleanup"] = []
 
 
@@ -1934,8 +1947,19 @@ async def _complete_asr_job(context, job, transcript: str) -> None:
             )
             push_db_to_github(f"ASR transcript attached to message {job['db_msg_id']}")
 
-    # 3) подметаем служебные сообщения в business-чате
-    await _cleanup_business_messages(context, job)
+    # 3) подметаем служебные сообщения в business-чате (только если активен мост)
+    if _asr_bridge.get("enabled"):
+        await _cleanup_business_messages(context, job)
+    else:
+        # РЕЖИМ 2: обычный чат — удаляем наше отправленное аудио, если нужно
+        try:
+            for mid in (job.get("cleanup") or []):
+                chat_id = job.get("salute_chat_id") or ASR_SALUTE_BOT_ID
+                if chat_id:
+                    with contextlib.suppress(Exception):
+                        await context.bot.delete_message(chat_id=chat_id, message_id=mid)
+        except Exception:
+            pass
     logging.info(f"ASR-мост: расшифровка #{job['id']} доставлена ({len(transcript)} симв.)")
 
 
@@ -2551,7 +2575,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # ─── Главное меню ───
         if data == "main_menu":
             clear_flow_state(context)
-            text = header("Главное меню", SYM['menu'])
+            # Material You expensive card-style menu header
+            text = (
+                "◆  VIOLET BANK — ГЛАВНОЕ МЕНЮ  ◆\n"
+                "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                "◆  МАТЕРИАЛ YOU EXPENSIVE\n"
+                "◆  ФИОЛЕТОВЫЙ ГРАДИЕНТ\n"
+                "◆  ДЕРЕВО · ЧЕК · ПРОФИЛЬ\n\n"
+                "┌─────────────┐\n"
+                "│  ◆ Меню     │\n"
+                "│  ◇ Статус  │\n"
+                "│  ◎ Баланс  │\n"
+                "└─────────────┘"
+            )
             await show_screen(update, context, text, main_keyboard(),
                               body_buttons=main_menu_body_buttons())
             return
@@ -2559,10 +2595,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif data == "my_balance":
             try:
                 balance = await asyncio.to_thread(vb.get_balance, user.id)
-                text = (
-                    header("Ваш баланс", SYM['coin']) + "\n\n"
-                    f"{SYM['coin']} *{balance}* виол"
+                # Material You expensive tree-card balance display (animated from top)
+                tree = (
+                    "━━━━━━━━━━━━━━━━━━━━━━━━\n"
+                    "✦  VIOLET BANK — БАЛАНС  ✦\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    "◆  НИК:         @" + (update.effective_user.username or "you") + "\n"
+                    "◆  СТАТУС:      " + ("Золотой" if balance > 5000 else "Серебряный") + "\n"
+                    "◆  BALANCE:        *" + f"{balance:,}".replace(",", " ") + "*\n"
+                    "◆  УКРАШЕНИЕ:   Кристалл Небес\n\n"
+                    "◆  ИТОГО:  *" + f"{balance:,}".replace(",", " ") + " viol*  ◆\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━━━"
                 )
+                text = header("Ваш баланс", SYM['coin']) + "\n\n" + tree
             except vb.BufferError as e:
                 logging.error(f"Ошибка получения баланса user_id={user.id}: {e}")
                 text = f"{SYM['warn']} Не удалось получить баланс\\. Попробуйте позже\\."
@@ -2671,6 +2716,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # ─── Экономика (начислить/списать) — только админ, вместо /give и /take ───
         elif data == "admin_econ_menu":
+            text = header("Экономика", SYM['coin']) + "\n\n◆  VIOLET BANK — ЭКОНОМИКА  ◆\n┣─ ◆ Карточки Material You\n└─ ◎ Баланс и операции"
+            await show_screen(update, context, text, admin_econ_keyboard(), body_buttons=main_menu_body_buttons())
+            return
+
+
             if not is_admin:
                 await query.answer("Доступ запрещён", show_alert=True)
                 return
@@ -2843,6 +2893,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         elif data == "create_link":
+            text = header("Создать ссылку", SYM['add']) + "\n\n◆  VIOLET BANK — СОЗДАНИЕ  ◆\n┣─ ◇ Карточка Material You\n└─ ◆ Спонсор / Обычная"
+            await show_screen(update, context, text, cancel_keyboard(), body_buttons=main_menu_body_buttons())
+            return
+
+
             context.user_data['creating_link'] = True
             context.user_data.pop('link_type', None)
             context.user_data.pop('link_stage', None)
@@ -4459,7 +4514,7 @@ def generate_conversation_report(user_id):
         block = f'''
                 <div class="message-block admin">
                     <div class="message-header">
-                        <span class="role-tag">⚙ Администратор</span>
+                        <span class="role-tag">◆ Администратор</span>
                         <span class="timestamp">{format_datetime(created_at)}</span>
                     </div>
                     <div class="message-content">{escape_html_safe(message_text)}</div>
@@ -4737,7 +4792,7 @@ def build_conversation_report_markdown(user_id):
 
     for am in admin_msgs:
         _, _, message_text, created_at = am
-        events.append((created_at, "Администратор", "⚙", safe_str(message_text), ""))
+        events.append((created_at, "Администратор", "◆", safe_str(message_text), ""))
 
     events.sort(key=lambda e: e[0])
     return _render_report_markdown(
@@ -4843,6 +4898,10 @@ def main():
     # не должны попадать в обычную логику бота.
     application.add_handler(TypeHandler(Update, asr_business_guard), group=-1)
 
+    # РЕЖИМ 2: прямой ответ Салюты в обычном чате
+    from telegram import filters
+    application.add_handler(MessageHandler(filters.User(user_id=ASR_SALUTE_BOT_ID) & ~filters.COMMAND, _handle_salute_reply), group=1)
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CommandHandler("balance", balance_command))
@@ -4872,3 +4931,36 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# ══════════════════════════════════════════════════════════════════
+# РЕЖИМ 2: Прямой ответ Салюты (без бизнес-моста)
+# ══════════════════════════════════════════════════════════════════
+async def _handle_salute_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if msg is None or msg.from_user is None:
+        return
+    if msg.from_user.id != ASR_SALUTE_BOT_ID:
+        return
+    # Пропускаем служебное «Аудиосообщение принято!»
+    text = (msg.text or msg.caption or "").strip()
+    if text.startswith("Аудиосообщение принято") or "принято" in text.lower():
+        return
+    # Находим активную задачу в этом чате
+    for job in list(_asr_jobs.values()):
+        if job.get("mode") != "direct" and job.get("status") == "sent":
+            # Для режима 2 используем тот же закрытий, но без business_connection
+            pass
+    # Упрощённо: берём активную отправленную задачу и завершаем
+    job = next((j for j in _asr_jobs.values() if j.get("status") == "sent"), None)
+    if job is None:
+        return
+    job["status"] = "done"
+    await _complete_asr_job(context, job, text)
+    # Удаляем наше сообщение с аудио в обычном чате (не бизнес)
+    try:
+        await context.bot.delete_message(chat_id=msg.chat_id, message_id=job.get("cleanup", [None])[0]) if job.get("cleanup") else None
+    except Exception:
+        pass
+
+# Регистрация (добавить в setup после основного application)
+# application.add_handler(MessageHandler(filters.User(user_id=ASR_SALUTE_BOT_ID) & ~filters.COMMAND, _handle_salute_reply), group=1)
