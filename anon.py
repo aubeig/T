@@ -13,13 +13,19 @@ import json
 import threading
 import httpx
 from datetime import datetime, timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from io import BytesIO
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto,
+    InlineQueryResultArticle, InlineQueryResultCachedPhoto, InputTextMessageContent,
+)
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import (Application, CommandHandler, CallbackQueryHandler, ContextTypes,
-                          MessageHandler, TypeHandler, ApplicationHandlerStop, filters)
+                          MessageHandler, TypeHandler, ApplicationHandlerStop, InlineQueryHandler,
+                          ChosenInlineResultHandler, ChatMemberHandler, filters)
 from git import Repo
 import violet_buffer as vb
 import salute_asr
+import cards
 
 # ══════════════════════════════════════════════════════════════════
 #  ЭКОНОМИКА (Violet Buffer)
@@ -68,10 +74,11 @@ SPONSOR_LINK_PRICE = 3500        # цена покупки спонсорско�
 #      ботам пересылать сообщения ботам, ошибка chat not found);
 #   3. личный чат с @smartspeech_sber_bot должен существовать
 #      (достаточно один раз кинуть ему любое сообщение).
-# Приоритет расшифровки: Salute API (SALUTE_CLIENT_SECRET) → бизнес-мост →
-# ручная карточка. Ничего не настроено — сообщения просто уходят без
-# расшифровки, как раньше.
+# Расшифровка: бот сам кладёт голосовое/кружок в группу «РАСШИФРОВКИ»,
+# где сидит @smartspeech_sber_bot. Первое сообщение Salute игнорируем,
+# следующее с текстом — расшифровка. API — только если в группу не ушло.
 ASR_RELAY_CHAT_ID = int(os.environ.get("ASR_RELAY_CHAT_ID", "3811126444") or 0)
+ASR_RELAY_TITLE = os.environ.get("ASR_RELAY_TITLE", "РАСШИФРОВКИ")
 ASR_SALUTE_BOT = (os.environ.get("ASR_SALUTE_BOT", "smartspeech_sber_bot") or "").lstrip("@").lower()
 ASR_SALUTE_BOT_ID = int(os.environ.get("ASR_SALUTE_BOT_ID", "5244379085") or 0)
 ASR_JOB_TIMEOUT = int(os.environ.get("ASR_JOB_TIMEOUT", "240"))
@@ -1429,23 +1436,39 @@ async def send_rich_draft(chat_id, draft_id, markdown_text) -> bool:
     return bool(data.get("ok"))
 
 
-async def _stream_asr_status(context, chat_id):
+async def _stream_asr_status(context, chat_id, job=None):
     """
-    Показывает анимируемый статус «Расшифровываю…» через sendRichMessageDraft
-    (блок <tg-thinking>, RichBlockThinking — только для черновиков), пока идёт
-    распознавание речи. Крутится в фоне; его гасят при завершении расшифровки.
-    Любая ошибка/недоступность черновиков просто останавливает индикатор —
-    сама расшифровка и основной флоу не затрагиваются.
+    Стриминг ожидания расшифровки: живое сообщение «Расшифровываю… Ns»
+    (edit каждую секунду) + rich-draft <tg-thinking>, пока Salute думает.
+    Не удаляет чужие сообщения. Гасится, когда job.status станет done/failed
+    или задачу отменят.
     """
-    draft_id = secrets.randbelow(2 ** 31 - 2) + 1  # draft_id обязан быть не-нулевым
-    label = f"{SYM['voice']} Расшифровываю аудио"
-    for i in range(180):
-        md = f"<tg-thinking>{label}</tg-thinking>\n\n`{i + 1}` сек"
+    draft_id = secrets.randbelow(2 ** 31 - 2) + 1
+    status_id = job.get("status_msg_id") if job else None
+    if not status_id:
         try:
-            if not await send_rich_draft(chat_id, draft_id, md):
-                return
-        except Exception:
+            sent = await context.bot.send_message(chat_id, f"{SYM['voice']} Расшифровываю…")
+            status_id = sent.message_id
+            if job is not None:
+                job["status_msg_id"] = status_id
+        except Exception as e:
+            logging.info(f"ASR stream: не отправил статус: {e}")
+    for i in range(max(1, ASR_JOB_TIMEOUT)):
+        if job is not None and job.get("status") in ("done", "failed"):
             return
+        label = f"{SYM['voice']} Расшифровываю… {i + 1}с"
+        if status_id:
+            try:
+                await context.bot.edit_message_text(chat_id=chat_id, message_id=status_id, text=label)
+            except Exception:
+                pass
+        try:
+            await send_rich_draft(
+                chat_id, draft_id,
+                f"<tg-thinking>{SYM['voice']} Расшифровываю аудио</tg-thinking>\n\n{i + 1} сек",
+            )
+        except Exception:
+            pass
         await asyncio.sleep(1.0)
 
 
@@ -1573,12 +1596,34 @@ def _salute_chat_targets() -> list:
     return targets
 
 
+def _norm_chat_title(title: str) -> str:
+    return (title or "").upper().replace("Ё", "Е")
+
+
+def _remember_decrypt_chat(chat) -> bool:
+    """Если чат называется «РАСШИФРОВКИ» — запоминаем его id для Salute."""
+    if chat is None:
+        return False
+    title = getattr(chat, "title", None) or ""
+    want = _norm_chat_title(ASR_RELAY_TITLE)
+    if not want or want not in _norm_chat_title(title):
+        return False
+    cid = chat.id
+    if _asr_bridge.get("relay_chat_id") != cid:
+        _asr_bridge["relay_chat_id"] = cid
+        try:
+            _asr_state_save()
+        except Exception:
+            pass
+        logging.info(f"ASR: группа «{title}» chat_id={cid}")
+    return True
+
+
 def _relay_targets() -> list:
     """
-    Куда слать карточки/уведомления владельцу. ID 3811126444 — это чат «я +
-    два бота»; в Bot API у групповых чатов id ОТРИЦАТЕЛЬНЫЙ, поэтому если
-    положительный вариант не проходит (chat not found), пробуем -3811126444.
-    Рабочий вариант запоминается в bot_state.
+    Куда слать голосовые для Salute: сначала запомненная группа
+    «РАСШИФРОВКИ», затем ASR_RELAY_CHAT_ID и его отрицательный вариант
+    (у супергрупп id отрицательный).
     """
     targets = []
     if _asr_bridge.get("relay_chat_id"):
@@ -1587,7 +1632,14 @@ def _relay_targets() -> list:
         targets.append(ASR_RELAY_CHAT_ID)
         if ASR_RELAY_CHAT_ID > 0 and -ASR_RELAY_CHAT_ID not in targets:
             targets.append(-ASR_RELAY_CHAT_ID)
-    return targets
+    # уникальные, порядок сохранён
+    seen = set()
+    out = []
+    for t in targets:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
 
 
 async def _try_relay_send(context, send_fn):
@@ -1702,51 +1754,27 @@ async def asr_business_guard(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def _handle_business_message(context, bmsg) -> None:
-    """Ответы бот-расшифровщика: пропускаем служебные, первый текст = расшифровка."""
+    """Ответы Salute через business: то же правило — первое игнор, дальше текст."""
     try:
         sender = bmsg.from_user
         if sender is None:
             return
-        sender_is_salute = (
-            getattr(sender, "id", None) == ASR_SALUTE_BOT_ID
-            or (sender.username or "").lower() == ASR_SALUTE_BOT
-        )
         chat_id = bmsg.chat.id
-
         if not sender.is_bot:
-            # Владелец САМ написал/переслал что-то Салюту в личный чат —
-            # запоминаем этот чат (id личного чата = id собеседника)
             if chat_id == ASR_SALUTE_BOT_ID and _asr_bridge["salute_chat_id"] != chat_id:
                 _asr_bridge["salute_chat_id"] = chat_id
-                _asr_state_save()  # помним чат Salute и после рестарта
-                logging.info(f"ASR-мост: запомнил чат Salute из исходящих владельца (chat_id={chat_id})")
-                asyncio.create_task(_asr_pump(context))  # вдруг очередь уже ждёт мост
+                _asr_state_save()
+                logging.info(f"ASR: запомнил чат Salute из исходящих (chat_id={chat_id})")
+                asyncio.create_task(_asr_pump(context))
             return
-        if not sender_is_salute:
+        if not _is_salute_user(sender):
             return
-        if _asr_bridge["salute_chat_id"] != chat_id:
+        if _asr_bridge.get("salute_chat_id") != chat_id:
             _asr_bridge["salute_chat_id"] = chat_id
             _asr_state_save()
-            logging.info(f"ASR-мост: запомнил чат Salute (chat_id={chat_id})")
-            asyncio.create_task(_asr_pump(context))  # вдруг очередь уже ждёт мост
-
-        job = next(
-            (j for j in _asr_jobs.values()
-             if j.get("mode") == "business" and j.get("status") == "sent"),
-            None,
-        )
-        if job is None:
-            return
-        job.setdefault("cleanup", []).append(bmsg.message_id)
-
-        text = (bmsg.text or bmsg.caption or "").strip()
-        if not text or _norm_asr_text(text) in _ASR_PLACEHOLDER_NORMS:
-            return  # «Аудиосообщение принято!» и подобные — пропускаем
-
-        job["status"] = "done"
-        await _complete_asr_job(context, job, text)
+        await _handle_relay_salute(context, bmsg)
     except Exception as e:
-        logging.warning(f"ASR-мост: ошибка обработки business_message: {e}")
+        logging.warning(f"ASR: ошибка обработки business_message: {e}")
 
 
 def _enqueue_asr_job(context, *, msg_type: str, file_id: str, recipient: int,
@@ -1768,14 +1796,34 @@ def _enqueue_asr_job(context, *, msg_type: str, file_id: str, recipient: int,
     }
     _asr_jobs[job["id"]] = job
     _asr_queue.append(job["id"])
+    job["stream_task"] = asyncio.create_task(_stream_asr_status(context, recipient, job))
     asyncio.create_task(_asr_pump(context))
+
+
+def _is_salute_user(user) -> bool:
+    if user is None:
+        return False
+    return (
+        getattr(user, "id", None) == ASR_SALUTE_BOT_ID
+        or (getattr(user, "username", None) or "").lower() == ASR_SALUTE_BOT
+    )
+
+
+def _is_relay_chat(chat_id) -> bool:
+    if not chat_id:
+        return False
+    known = set(_relay_targets())
+    if _asr_bridge.get("relay_chat_id"):
+        known.add(_asr_bridge["relay_chat_id"])
+    return chat_id in known
 
 
 async def _asr_pump(context) -> None:
     """
-    Разбор очереди. Salute обрабатывает файлы по одному — пока есть задача
-    в полёте (status=sent), остальные ждут. Ручные карточки не блокируют
-    очередь и идут параллельно.
+    Разбор очереди. Сначала САМИ пересылаем голосовое/кружок в чат,
+    где сидит @smartspeech_sber_bot. Ждём его ответ (первое сообщение
+    пропускаем, второе = расшифровка). API Salute — только если
+    переслать в чат не вышло.
     """
     global _asr_pump_running
     if _asr_pump_running:
@@ -1784,20 +1832,33 @@ async def _asr_pump(context) -> None:
     try:
         while True:
             if any(j.get("status") == "sent" for j in _asr_jobs.values()):
-                return  # ждём ответ Salute по текущей задаче
+                return
             jid = next((i for i in _asr_queue if i in _asr_jobs), None)
             if jid is None:
                 _asr_queue.clear()
                 return
             job = _asr_jobs[jid]
-            if _asr_bridge_for(job["recipient"]):
+            try:
+                ok = await _send_job_to_salute(context, job)
+            except Exception as e:
+                logging.warning(f"ASR: не отправил файл Салюту: {e}")
+                ok = False
+            if ok:
+                _asr_queue.remove(jid)
+                continue
+            # запасной путь — Salute API, если чат недоступен
+            if salute_asr.enabled():
                 try:
-                    ok = await _send_job_to_salute(context, job)
+                    transcript = await _transcribe_with_streaming(
+                        context, job["recipient"], job["file_id"], job["msg_type"]
+                    )
                 except Exception as e:
-                    logging.warning(f"ASR-мост: не отправил файл Salute: {e}")
-                    ok = False
-                if ok:
+                    logging.warning(f"ASR API fallback: {e}")
+                    transcript = None
+                if transcript:
                     _asr_queue.remove(jid)
+                    job["status"] = "done"
+                    await _complete_asr_job(context, job, transcript)
                     continue
             _asr_queue.remove(jid)
             await _send_manual_card(context, job)
@@ -1806,65 +1867,41 @@ async def _asr_pump(context) -> None:
 
 
 async def _send_job_to_salute(context, job) -> bool:
-    """Отправляет аудио от имени владельца в его ЛИЧНЫЙ чат с бот-расшифровщиком."""
-    f = await context.bot.get_file(job["file_id"])
-    data = bytes(await f.download_as_bytearray())
-    if job["msg_type"] == "video_note":
-        ogg = await asyncio.to_thread(salute_asr._extract_audio_from_video_note, data)
-        if ogg:
-            method, field, data, name, mime = "sendVoice", "voice", ogg, "audio.ogg", "audio/ogg"
-        else:
-            method, field, name, mime = "sendVideoNote", "video_note", "video.mp4", "video/mp4"
-    else:
-        method, field, name, mime = "sendVoice", "voice", "audio.oga", "audio/ogg"
-
-    targets = _salute_chat_targets()
-    if not targets:
-        logging.warning("ASR-мост: цель отправки не определена")
-        return False
-    last_desc = ""
-    for chat_id in targets:
-        fields = {
-            "chat_id": str(chat_id),
-            "business_connection_id": str(_asr_bridge["connection_id"]),
-        }
-        r = await _bot_file_call(method, fields, field, data, name, mime)
-        if r.get("ok"):
-            if _asr_bridge["salute_chat_id"] != chat_id:
-                _asr_bridge["salute_chat_id"] = chat_id
-                _asr_state_save()
+    """
+    Сами отправляем голосовое/кружок в чат, где есть бот Salute.
+    Без business_connection, без удаления чужих сообщений.
+    """
+    last_err = None
+    for chat_id in _relay_targets():
+        try:
+            if job["msg_type"] == "video_note":
+                m = await context.bot.send_video_note(chat_id, video_note=job["file_id"])
+            else:
+                m = await context.bot.send_voice(chat_id, voice=job["file_id"])
             job["status"] = "sent"
-            job["cleanup"] = [r["result"]["message_id"]]
+            job["mode"] = "relay"
+            job["relay_chat_id"] = chat_id
+            job["sent_msg_id"] = m.message_id
+            job["salute_msgs"] = 0
+            if _asr_bridge.get("relay_chat_id") != chat_id:
+                _asr_bridge["relay_chat_id"] = chat_id
+                _asr_state_save()
             job["watchdog"] = asyncio.create_task(_asr_job_watchdog(job["id"]))
-            logging.info(f"ASR-мост: задача #{job['id']} отправлена Салюту (chat_id={chat_id})")
+            job["stream_task"] = asyncio.create_task(
+                _stream_asr_status(context, job["recipient"], job)
+            )
+            logging.info(f"ASR: задача #{job['id']} отправлена в чат Салюта (chat_id={chat_id})")
             return True
-        last_desc = str(r.get("description") or "")
-        logging.warning(f"ASR-мост: {method} в chat_id={chat_id} не удался: {last_desc}")
-
-    # Бизнес-сессия протухла (владелец отключил бота/завершил сессию) —
-    # выключаем мост, уходим в ручные карточки и предупреждаем владельца
-    low = last_desc.lower()
-    if "business_connection" in low or "BUSINESS_CONNECTION" in last_desc:
-        _asr_bridge["enabled"] = False
-        _asr_state_save()
-        await _notify_relay(
-            context,
-            f"{SYM['warn']} Мост расшифровки отключился (business-сессия недействительна).\n"
-            f"Заново подключи меня в Настройки → Для бизнеса → Чат-боты, "
-            f"и расшифровка снова заработает автоматически.",
-        )
-    elif "chat not found" in low or "chat_id" in low:
-        await _notify_relay(
-            context,
-            f"{SYM['warn']} Не смог отправить аудио @{ASR_SALUTE_BOT} ({last_desc}).\n\n"
-            f"{_asr_setup_hint()}\n\n"
-            f"Пока пришлю карточку для ручной расшифровки.",
-        )
+        except Exception as e:
+            last_err = e
+            logging.warning(f"ASR: send в chat_id={chat_id} не удался: {e}")
+    if last_err:
+        logging.warning(f"ASR: ни один чат-релей не принял файл: {last_err}")
     return False
 
 
 async def _asr_job_watchdog(job_id: int) -> None:
-    """Salute не ответил за ASR_JOB_TIMEOUT секунд — подметаем и уходим в ручной режим."""
+    """Salute не ответил за ASR_JOB_TIMEOUT секунд — уходим в ручной режим. Ничего не удаляем."""
     try:
         await asyncio.sleep(ASR_JOB_TIMEOUT)
     except asyncio.CancelledError:
@@ -1872,59 +1909,79 @@ async def _asr_job_watchdog(job_id: int) -> None:
     job = _asr_jobs.get(job_id)
     if not job or job.get("status") != "sent":
         return
+    job["status"] = "failed"
+    st = job.pop("stream_task", None)
+    if st:
+        st.cancel()
     _asr_jobs.pop(job_id, None)
     context = job.get("context")
-    logging.warning(f"ASR-мост: таймаут расшифровки #{job_id}, перевожу в ручной режим")
-    await _cleanup_business_messages(context, job)
-    await _notify_relay(
-        context,
-        f"{SYM['warn']} @{ASR_SALUTE_BOT} не ответил за {ASR_JOB_TIMEOUT} c (задача #{job_id}).\n"
-        f"Отправляю карточку для ручной расшифровки.",
-    )
+    logging.warning(f"ASR: таймаут расшифровки #{job_id}")
     if context:
         await _send_manual_card(context, job)
         asyncio.create_task(_asr_pump(context))
 
 
-async def _cleanup_business_messages(context, job) -> None:
-    """Подметаем за собой в business-чате (наш файл + служебные ответы Salute)."""
-    cleanup = job.get("cleanup") or []
-    conn_id = _asr_bridge.get("connection_id")
-    if not cleanup or not conn_id or not context:
+async def _stream_transcript_out(context, chat_id, msg_id, transcript: str, noun: str) -> None:
+    """Стриминг готового текста расшифровки в то же статус-сообщение."""
+    header = f"{SYM['voice']} Расшифровка {noun}:\n"
+    words = (transcript or "").split()
+    if not words:
+        text = header + "—"
+        if msg_id:
+            try:
+                await context.bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text)
+            except Exception:
+                await send_rich_or_plain(context.bot, chat_id, f"{SYM['voice']} *Расшифровка {noun}:*\n{quote(esc(transcript))}")
+        else:
+            await send_rich_or_plain(context.bot, chat_id, f"{SYM['voice']} *Расшифровка {noun}:*\n{quote(esc(transcript))}")
         return
-    r = await _rich_api_call("deleteMessages", {
-        "business_connection_id": str(conn_id),
-        "message_ids": cleanup[:100],
-    })
-    if not r.get("ok"):
-        logging.info(f"ASR-мост: не получилось подмести: {r.get('description')}")
-    job["cleanup"] = []
+    acc = []
+    for i, w in enumerate(words):
+        acc.append(w)
+        last = i == len(words) - 1
+        if last or (i + 1) % 4 == 0:
+            body = " ".join(acc)
+            if msg_id:
+                try:
+                    await context.bot.edit_message_text(
+                        chat_id=chat_id, message_id=msg_id, text=header + body
+                    )
+                except Exception:
+                    msg_id = None
+            if not msg_id and last:
+                await send_rich_or_plain(
+                    context.bot, chat_id,
+                    f"{SYM['voice']} *Расшифровка {noun}:*\n{quote(esc(transcript))}",
+                )
+            await asyncio.sleep(0.07)
 
 
 async def _complete_asr_job(context, job, transcript: str) -> None:
-    """Расшифровка готова: доставляем получателю, подшиваем в БД, подметаем."""
+    """Расшифровка готова: стримим получателю, подшиваем в БД. Сообщения Salute НЕ трогаем."""
+    job["status"] = "done"
     _asr_jobs.pop(job["id"], None)
     wd = job.pop("watchdog", None)
     if wd:
         wd.cancel()
+    st = job.pop("stream_task", None)
+    if st:
+        st.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await asyncio.sleep(0)
     transcript = (transcript or "").strip()[:3500]
     noun = "кружка" if job["msg_type"] == "video_note" else "голосового сообщения"
 
-    # 1) получателю — отдельным сообщением следом за медиа
     try:
-        await send_rich_or_plain(
-            context.bot, job["recipient"],
-            f"{SYM['voice']} *Расшифровка {noun}:*\n{quote(esc(transcript))}",
+        await _stream_transcript_out(
+            context, job["recipient"], job.get("status_msg_id"), transcript, noun
         )
     except Exception as e:
-        logging.warning(f"ASR-мост: не доставил расшифровку получателю {job['recipient']}: {e}")
+        logging.warning(f"ASR: не доставил расшифровку получателю {job['recipient']}: {e}")
 
-    # 2) в БД — к тексту сообщения (видно в «Моих сообщениях» и отчётах).
-    # Если эта расшифровка уже подшита (повторный запрос) — не дублируем.
     if job.get("db_msg_id"):
         stored = job.get("stored_text")
         if transcript in (stored or ""):
-            logging.info(f"ASR-мост: расшифровка #{job['id']} уже есть в сообщении {job['db_msg_id']}")
+            logging.info(f"ASR: расшифровка #{job['id']} уже есть в сообщении {job['db_msg_id']}")
         else:
             new_text = f"{stored}\n{transcript}" if stored else transcript
             run_query(
@@ -1934,9 +1991,47 @@ async def _complete_asr_job(context, job, transcript: str) -> None:
             )
             push_db_to_github(f"ASR transcript attached to message {job['db_msg_id']}")
 
-    # 3) подметаем служебные сообщения в business-чате
-    await _cleanup_business_messages(context, job)
-    logging.info(f"ASR-мост: расшифровка #{job['id']} доставлена ({len(transcript)} симв.)")
+    logging.info(f"ASR: расшифровка #{job['id']} доставлена ({len(transcript)} симв.)")
+    if context:
+        asyncio.create_task(_asr_pump(context))
+
+
+async def _handle_relay_salute(context, msg) -> bool:
+    """
+    Сообщение от @smartspeech_sber_bot.
+    Первое — всегда игнор («Аудиосообщение принято!» и т.п.).
+    Следующее с текстом — расшифровка. Ничего не удаляем.
+    """
+    if msg is None or not _is_salute_user(msg.from_user):
+        return False
+    job = next(
+        (j for j in _asr_jobs.values() if j.get("status") == "sent"),
+        None,
+    )
+    if job is None:
+        return True  # Salute что-то написал вне задачи — не удаляем, не кормим handle_text
+    job["salute_msgs"] = job.get("salute_msgs", 0) + 1
+    text = (msg.text or msg.caption or "").strip()
+    if job["salute_msgs"] == 1:
+        logging.info(f"ASR: пропускаю первое сообщение Salute ({text[:80]!r})")
+        return True
+    if not text or _norm_asr_text(text) in _ASR_PLACEHOLDER_NORMS:
+        logging.info("ASR: служебная фраза Salute, жду расшифровку")
+        return True
+    job["status"] = "done"
+    await _complete_asr_job(context, job, text)
+    return True
+
+
+async def asr_relay_guard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Перехват сообщений Salute в любом чате, чтобы handle_text их не удалил."""
+    msg = update.effective_message
+    if msg is None or getattr(msg, "from_user", None) is None:
+        return
+    if not _is_salute_user(msg.from_user):
+        return
+    await _handle_relay_salute(context, msg)
+    raise ApplicationHandlerStop()
 
 
 async def _send_manual_card(context, job) -> None:
@@ -2017,36 +2112,78 @@ async def _handle_manual_asr_reply(update, context, job_id: int, text: str) -> b
 # id последнего экрана-меню в user_data['screen_msg_id'], и любое
 # обновление экрана идёт через edit, а не через новое сообщение.
 
+def _card_title_from_text(text: str) -> str:
+    raw = text or "Меню"
+    raw = raw.replace("\\", "")
+    raw = re.sub(r"<[^>]+>", " ", raw)
+    raw = re.sub(r"[*_`>#\[\]]", " ", raw)
+    parts = [re.sub(r"\s+", " ", p).strip(" |") for p in raw.split("\n") if p.strip()]
+    title = parts[0] if parts else "Меню"
+    return (title[:40] or "Меню")
+
+
+def _photo_caption(text: str, parse_mode):
+    if not text:
+        return None, None
+    if len(text) <= 1024:
+        return text, parse_mode
+    acc, n = [], 0
+    for line in text.split("\n"):
+        if n + len(line) + 1 > 900:
+            break
+        acc.append(line)
+        n += len(line) + 1
+    return ("\n".join(acc) if acc else text[:900]), None
+
+
 async def send_screen(context: ContextTypes.DEFAULT_TYPE, chat_id, text: str,
                       reply_markup=None, parse_mode='MarkdownV2',
                       disabled_callbacks=None, force_reply: bool = False,
-                      body_buttons=None):
+                      body_buttons=None, photo_bytes=None):
     """
-    Отправляет НОВОЕ сообщение-экран, отдавая приоритет Rich Message
-    (sendRichMessage, Bot API 10.1+), и запоминает состояние экрана в
-    user_data (screen_msg_id / screen_is_rich / screen_force_reply).
-    body_buttons — кнопки в теле сообщения (см. send_rich_message).
-    Возвращает message_id отправленного сообщения.
+    Отправляет НОВОЕ сообщение-экран. Если есть photo_bytes — фото-карточка
+    (HTML-вёрстка) с подписью и клавиатурой. Иначе Rich Message / текст.
     """
+    if photo_bytes:
+        cap, pm = _photo_caption(text, parse_mode)
+        try:
+            sent = await context.bot.send_photo(
+                chat_id=chat_id, photo=BytesIO(photo_bytes),
+                caption=cap, parse_mode=pm, reply_markup=reply_markup,
+            )
+        except TelegramError:
+            sent = await context.bot.send_photo(
+                chat_id=chat_id, photo=BytesIO(photo_bytes),
+                caption=_card_title_from_text(text), reply_markup=reply_markup,
+            )
+        context.user_data['screen_msg_id'] = sent.message_id
+        context.user_data['screen_is_rich'] = False
+        context.user_data['screen_is_photo'] = True
+        context.user_data['screen_force_reply'] = False
+        return sent.message_id
+
     want_rich = RICH_MESSAGES_ENABLED and parse_mode == 'MarkdownV2'
     if want_rich:
         msg_id = await send_rich_message(chat_id, text, reply_markup, disabled_callbacks, force_reply, body_buttons)
         if msg_id is not None:
             context.user_data['screen_msg_id'] = msg_id
             context.user_data['screen_is_rich'] = True
+            context.user_data['screen_is_photo'] = False
             context.user_data['screen_force_reply'] = bool(force_reply)
             return msg_id
 
     sent = await context.bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode, reply_markup=reply_markup)
     context.user_data['screen_msg_id'] = sent.message_id
     context.user_data['screen_is_rich'] = False
+    context.user_data['screen_is_photo'] = False
     context.user_data['screen_force_reply'] = False
     return sent.message_id
 
 
 async def show_screen(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str,
                        reply_markup=None, parse_mode='MarkdownV2', disabled_callbacks=None,
-                       force_reply: bool = False, body_buttons=None):
+                       force_reply: bool = False, body_buttons=None, photo_bytes=None,
+                       skip_card: bool = False):
     """
     Показывает "экран" — редактируя предыдущее сообщение-меню этого
     пользователя, либо отправляя новое, если редактировать нечего.
@@ -2073,7 +2210,18 @@ async def show_screen(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
     обычном откате используется reply_markup.
     """
     chat_id = update.effective_chat.id
-    want_rich = RICH_MESSAGES_ENABLED and parse_mode == 'MarkdownV2'
+    if photo_bytes is None and not skip_card:
+        user = update.effective_user
+        if user is not None:
+            try:
+                photo_bytes = await _make_menu_png(
+                    context.bot, user, _card_title_from_text(text),
+                )
+            except Exception as e:
+                logging.info(f"auto card: {e}")
+                photo_bytes = None
+    want_photo = bool(photo_bytes)
+    want_rich = (not want_photo) and RICH_MESSAGES_ENABLED and parse_mode == 'MarkdownV2'
 
     query = update.callback_query
     edit_msg_id = (query.message.message_id
@@ -2081,42 +2229,60 @@ async def show_screen(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
                    else context.user_data.get('screen_msg_id'))
 
     current_rich = bool(context.user_data.get('screen_is_rich', False))
+    current_photo = bool(context.user_data.get('screen_is_photo', False))
     current_fr = bool(context.user_data.get('screen_force_reply', False))
 
-    # 1. Пробуем отредактировать текущее сообщение, если его режим совпадает
-    #    с требуемым (rich <-> rich, plain <-> plain, force_reply неизменен).
     if edit_msg_id:
-        same_mode = (current_rich == want_rich)
-        same_fr = (bool(force_reply) == current_fr) if want_rich else True
-
-        if same_mode and same_fr:
-            if want_rich:
-                if await edit_rich_message(chat_id, edit_msg_id, text, reply_markup, disabled_callbacks, force_reply, body_buttons):
+        if want_photo and current_photo:
+            try:
+                cap, pm = _photo_caption(text, parse_mode)
+                await context.bot.edit_message_media(
+                    chat_id=chat_id, message_id=edit_msg_id,
+                    media=InputMediaPhoto(media=BytesIO(photo_bytes), caption=cap or None,
+                                          parse_mode=pm),
+                    reply_markup=reply_markup,
+                )
+                context.user_data['screen_msg_id'] = edit_msg_id
+                context.user_data['screen_is_rich'] = False
+                context.user_data['screen_is_photo'] = True
+                context.user_data['screen_force_reply'] = False
+                return
+            except BadRequest as e:
+                if "Message is not modified" in str(e):
                     context.user_data['screen_msg_id'] = edit_msg_id
-                    context.user_data['screen_is_rich'] = True
-                    context.user_data['screen_force_reply'] = bool(force_reply)
+                    context.user_data['screen_is_photo'] = True
                     return
-            else:
-                try:
-                    await context.bot.edit_message_text(
-                        chat_id=chat_id, message_id=edit_msg_id,
-                        text=text, parse_mode=parse_mode, reply_markup=reply_markup
-                    )
-                    context.user_data['screen_msg_id'] = edit_msg_id
-                    context.user_data['screen_is_rich'] = False
-                    context.user_data['screen_force_reply'] = False
-                    return
-                except BadRequest as e:
-                    if "Message is not modified" in str(e):
+            except TelegramError as e:
+                logging.error(f"Ошибка edit photo: {e}")
+        elif (not want_photo) and (not current_photo):
+            same_mode = (current_rich == want_rich)
+            same_fr = (bool(force_reply) == current_fr) if want_rich else True
+            if same_mode and same_fr:
+                if want_rich:
+                    if await edit_rich_message(chat_id, edit_msg_id, text, reply_markup, disabled_callbacks, force_reply, body_buttons):
+                        context.user_data['screen_msg_id'] = edit_msg_id
+                        context.user_data['screen_is_rich'] = True
+                        context.user_data['screen_is_photo'] = False
+                        context.user_data['screen_force_reply'] = bool(force_reply)
+                        return
+                else:
+                    try:
+                        await context.bot.edit_message_text(
+                            chat_id=chat_id, message_id=edit_msg_id,
+                            text=text, parse_mode=parse_mode, reply_markup=reply_markup
+                        )
                         context.user_data['screen_msg_id'] = edit_msg_id
                         context.user_data['screen_is_rich'] = False
+                        context.user_data['screen_is_photo'] = False
                         context.user_data['screen_force_reply'] = False
                         return
-                except TelegramError as e:
-                    logging.error(f"Ошибка edit (по id): {e}")
+                    except BadRequest as e:
+                        if "Message is not modified" in str(e):
+                            context.user_data['screen_msg_id'] = edit_msg_id
+                            return
+                    except TelegramError as e:
+                        logging.error(f"Ошибка edit (по id): {e}")
 
-        # Режим сменился или edit не прошёл — убираем старое сообщение, чтобы
-        # не оставлять его висеть поверх нового (не плодить экраны).
         if context.user_data.get('screen_msg_id') == edit_msg_id:
             try:
                 await context.bot.delete_message(chat_id=chat_id, message_id=edit_msg_id)
@@ -2124,10 +2290,9 @@ async def show_screen(update: Update, context: ContextTypes.DEFAULT_TYPE, text: 
                 pass
         context.user_data.pop('screen_msg_id', None)
 
-    # 2. Отправляем новый экран.
     await send_screen(context, chat_id, text, reply_markup, parse_mode,
                       disabled_callbacks=disabled_callbacks, force_reply=force_reply,
-                      body_buttons=body_buttons)
+                      body_buttons=body_buttons, photo_bytes=photo_bytes)
 
 
 FLOW_KEYS = (
@@ -2167,6 +2332,126 @@ async def cleanup_user_message(update: Update):
 # ══════════════════════════════════════════════════════════════════
 #  КЛАВИАТУРЫ
 # ══════════════════════════════════════════════════════════════════
+
+_card_file_cache = {}
+_inline_last_ts = {}
+
+
+_avatar_cache = {}
+
+
+async def _get_avatar_bytes(bot, user_id):
+    now = time.time()
+    hit = _avatar_cache.get(user_id)
+    if hit and now - hit[0] < 600:
+        return hit[1]
+    data = None
+    try:
+        photos = await bot.get_user_profile_photos(user_id, limit=1)
+        if photos and photos.total_count and photos.photos:
+            f = await bot.get_file(photos.photos[0][-1].file_id)
+            data = bytes(await f.download_as_bytearray())
+    except Exception as e:
+        logging.info(f"аватар user={user_id} недоступен: {e}")
+    _avatar_cache[user_id] = (now, data)
+    return data
+
+
+def _status_label(user, is_admin=False) -> str:
+    if is_admin or is_admin_user(user):
+        return "админ"
+    return "участник"
+
+
+def _display_name(user) -> str:
+    if getattr(user, "username", None):
+        return f"@{user.username}"
+    return (getattr(user, "full_name", None) or getattr(user, "first_name", None) or str(user.id))
+
+
+async def _make_profile_png(bot, user, balance, is_admin=False):
+    avatar = await _get_avatar_bytes(bot, user.id)
+    return cards.render_balance_card(
+        name=_display_name(user),
+        status=_status_label(user, is_admin),
+        balance=balance if balance is not None else "—",
+        avatar=avatar,
+    )
+
+
+async def _make_menu_png(bot, user, title, subtitle="", balance=None):
+    avatar = await _get_avatar_bytes(bot, user.id)
+    return cards.render_menu_card(title=title, subtitle=subtitle, balance=balance, avatar=avatar)
+
+
+async def _upload_card_file_id(bot, png: bytes, key: str) -> str | None:
+    if key in _card_file_cache:
+        return _card_file_cache[key]
+    targets = _relay_targets()
+    if ADMIN_ID:
+        targets.append(ADMIN_ID)
+    for chat_id in targets:
+        try:
+            sent = await bot.send_photo(chat_id, photo=BytesIO(png))
+            file_id = sent.photo[-1].file_id
+            _card_file_cache[key] = file_id
+            try:
+                await bot.delete_message(chat_id, sent.message_id)
+            except Exception:
+                pass
+            return file_id
+        except Exception as e:
+            logging.info(f"upload card to {chat_id}: {e}")
+    return None
+
+
+async def animate_tree(bot, chat_id, message_id, frames, spam=False, inline_message_id=None):
+    """Сверху вниз. На спам — сразу финальный кадр."""
+    if spam or not frames:
+        text = frames[-1] if frames else ""
+        try:
+            if inline_message_id:
+                await bot.edit_message_text(text, inline_message_id=inline_message_id)
+            elif message_id:
+                await bot.edit_message_text(text, chat_id=chat_id, message_id=message_id)
+        except Exception:
+            pass
+        return
+    for fr in frames:
+        try:
+            if inline_message_id:
+                await bot.edit_message_text(fr, inline_message_id=inline_message_id)
+            elif message_id:
+                await bot.edit_message_text(fr, chat_id=chat_id, message_id=message_id)
+        except Exception:
+            break
+        await asyncio.sleep(0.28)
+
+
+async def show_balance_profile(update, context, user, balance, reply_markup=None, body_buttons=None, animate=True):
+    """Карточка профиля+баланса + дерево. Текст на карточке — только ник/статус/число."""
+    name = _display_name(user)
+    status = _status_label(user, is_admin_user(user))
+    try:
+        png = await _make_profile_png(context.bot, user, balance, is_admin_user(user))
+    except Exception as e:
+        logging.warning(f"карточка не собралась: {e}")
+        png = None
+    frames = cards.tree_frames(name, status, balance if balance is not None else "—")
+    spam = (time.time() - _inline_last_ts.get(user.id, 0)) < 2.5
+    _inline_last_ts[user.id] = time.time()
+    caption = frames[-1] if spam or not animate else frames[0]
+    await show_screen(
+        update, context, caption,
+        reply_markup or main_keyboard(),
+        parse_mode=None,
+        body_buttons=body_buttons,
+        photo_bytes=png,
+    )
+    if animate and not spam and png is None:
+        mid = context.user_data.get("screen_msg_id")
+        await animate_tree(context.bot, update.effective_chat.id, mid, frames, spam=False)
+
 
 def chunk_rows(buttons, per_row=2):
     """Раскладывает плоский список кнопок по рядам, чтобы меню не висело
@@ -2446,8 +2731,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             header("Анонимный Бот", SYM['menu']) + "\n\n"
             f"Создавайте ссылки для получения анонимных сообщений{esc('.')}"
         )
+        png = None
+        try:
+            png = await _make_menu_png(context.bot, user, "Анонимный бот", "ссылки · сообщения · виолы")
+        except Exception as e:
+            logging.info(f"меню-карточка: {e}")
         await send_screen(context, update.effective_chat.id, text, main_keyboard(),
-                          body_buttons=main_menu_body_buttons())
+                          body_buttons=main_menu_body_buttons(), photo_bytes=png)
     except Exception as e:
         logging.error(f"Ошибка в команде start: {e}")
         try:
@@ -2522,11 +2812,14 @@ async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"{SYM['warn']} Буфер недоступен\\. Попробуйте позже\\.", parse_mode='MarkdownV2')
             return
 
-        who = "Ваш баланс" if target_id == user.id else f"Баланс пользователя `{target_id}`"
-        await update.message.reply_text(
-            f"{SYM['coin']} {who}: *{balance}* виол",
-            parse_mode='MarkdownV2'
-        )
+        if target_id == user.id:
+            await show_balance_profile(update, context, user, balance, reply_markup=main_keyboard())
+        else:
+            who = f"Баланс пользователя `{target_id}`"
+            await update.message.reply_text(
+                f"{SYM['coin']} {who}: *{balance}* виол",
+                parse_mode='MarkdownV2'
+            )
     except Exception as e:
         logging.error(f"Ошибка в команде balance: {e}")
         try:
@@ -2546,28 +2839,34 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = query.from_user
         data = query.data
         is_admin = is_admin_user(user)
-        context.user_data['screen_msg_id'] = query.message.message_id
+        if data == "inl_keep":
+            return
+        if query.message is not None:
+            context.user_data['screen_msg_id'] = query.message.message_id
 
         # ─── Главное меню ───
         if data == "main_menu":
             clear_flow_state(context)
             text = header("Главное меню", SYM['menu'])
+            png = None
+            try:
+                png = await _make_menu_png(context.bot, user, "Главное меню", "ссылки · сообщения · виолы")
+            except Exception as e:
+                logging.info(f"меню-карточка: {e}")
             await show_screen(update, context, text, main_keyboard(),
-                              body_buttons=main_menu_body_buttons())
+                              body_buttons=main_menu_body_buttons(), photo_bytes=png)
             return
 
         elif data == "my_balance":
             try:
                 balance = await asyncio.to_thread(vb.get_balance, user.id)
-                text = (
-                    header("Ваш баланс", SYM['coin']) + "\n\n"
-                    f"{SYM['coin']} *{balance}* виол"
-                )
             except vb.BufferError as e:
-                logging.error(f"Ошибка получения баланса user_id={user.id}: {e}")
-                text = f"{SYM['warn']} Не удалось получить баланс\\. Попробуйте позже\\."
-            await show_screen(update, context, text, main_keyboard(),
-                              body_buttons=main_menu_body_buttons())
+                logging.error(f"balance card user_id={user.id}: {e}")
+                await show_screen(update, context, f"{SYM['warn']} buffer unavailable", main_keyboard())
+                return
+            await show_balance_profile(update, context, user, balance,
+                                       reply_markup=main_keyboard(),
+                                       body_buttons=main_menu_body_buttons())
             return
 
         elif data == "link_confirm_sponsor":
@@ -2870,8 +3169,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton(f"{SYM['gift']} Спонсорская", callback_data="link_type_sponsor")],
                 [InlineKeyboardButton(f"{SYM['cancel']} Отмена", callback_data="main_menu")],
             ])
+            png = None
+            try:
+                png = await _make_menu_png(context.bot, user, "Создание ссылки", "обычная или спонсорская", balance)
+            except Exception as e:
+                logging.info(f"create card: {e}")
             await show_screen(update, context, text, keyboard,
-                              body_buttons=link_type_body_buttons(balance))
+                              body_buttons=link_type_body_buttons(balance), photo_bytes=png)
             return
 
         elif data in ("link_type_normal", "link_type_sponsor"):
@@ -2910,30 +3214,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             await query.answer("Расшифровываю…")
 
-            if salute_asr.enabled():
-                # Salute API — расшифровываем прямо здесь, со стримингом статуса
-                transcript = await _transcribe_with_streaming(context, user.id, file_id, msg_type)
-                if transcript:
-                    await send_rich_or_plain(
-                        context.bot, owner_id,
-                        f"{SYM['voice']} *Расшифровка:*\n{quote(esc(transcript))}"
-                    )
-                    if transcript not in (stored_text or ""):
-                        new_text = f"{stored_text}\n{transcript}" if stored_text else transcript
-                        run_query(
-                            "UPDATE messages SET message_text = ? WHERE message_id = ?",
-                            (new_text, msg_id), commit=True,
-                        )
-                        push_db_to_github(f"ASR transcript (button) attached to message {msg_id}")
-                else:
-                    await send_rich_or_plain(
-                        context.bot, owner_id,
-                        f"{SYM['warn']} Расшифровать не удалось — попробуй ещё раз позже"
-                    )
-                return
-
-            # Мост (@smartspeech_sber_bot) или ручная карточка — задача в
-            # очередь, дальше разберётся pump. Медиа не задерживаем.
+            # Голос/кружок в группу «РАСШИФРОВКИ». API — только если отправка
+            # в группу не вышла (это решает pump).
             _enqueue_asr_job(
                 context,
                 msg_type=msg_type,
@@ -2942,11 +3224,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 db_msg_id=msg_id,
                 stored_text=stored_text,
             )
-            if _asr_bridge_for(owner_id):
-                await send_rich_or_plain(
-                    context.bot, owner_id,
-                    f"{SYM['voice']} Расшифровка готовится — пришлю следом{esc('.')}"
-                )
             return
 
         elif data.startswith("reply_"):
@@ -3057,8 +3334,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if data == "admin_panel":
                 clear_flow_state(context)
+                png = None
+                try:
+                    png = await _make_menu_png(context.bot, user, "Админ-панель", "статистика · пользователи · экономика")
+                except Exception as e:
+                    logging.info(f"admin card: {e}")
                 await show_screen(update, context, header("Панель администратора", SYM['gear']), admin_keyboard(),
-                                  body_buttons=admin_panel_body_buttons())
+                                  body_buttons=admin_panel_body_buttons(), photo_bytes=png)
                 return
 
             elif data == "admin_stats":
@@ -4164,19 +4446,13 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # ─── Расшифровка голосовых/кружков через спонсорские ссылки ───
-        # Приоритет: 1) Salute API (задан SALUTE_CLIENT_SECRET) — прямо здесь,
-        # со стримингом «Расшифровываю…»; 2) мост через @smartspeech_sber_bot
-        # (Telegram Business) — файл уходит боту, ответ забирается автоматически;
-        # 3) ручная карточка владельцу ссылки. Медиа при этом НЕ задерживаем —
-        # доставка идёт сразу, расшифровка придёт отдельным сообщением.
+        # Голос/кружок уходит в группу «РАСШИФРОВКИ» (Salute там).
+        # Первое его сообщение пропускаем, следующее — текст.
+        # API — только если в группу отправить не вышло. Медиа не задерживаем.
         transcript = None
         asr_deferred = False
         if link_info[5] and msg_type in ("voice", "video_note"):
-            owner_id = link_info[1]
-            if salute_asr.enabled():
-                transcript = await _transcribe_with_streaming(context, user.id, file_id, msg_type)
-            elif _asr_bridge_for(owner_id) or owner_id == ASR_RELAY_CHAT_ID:
-                asr_deferred = True
+            asr_deferred = True
 
         # Расшифровку храним как текст сообщения (если нет подписи) — тогда
         # она видна и в списке «Мои сообщения», и в отчётах переписок.
@@ -4817,6 +5093,108 @@ def run_http_server():
 #  ЗАПУСК БОТА
 # ══════════════════════════════════════════════════════════════════
 
+async def inline_query_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Инлайн баланс/профиль в любом чате. Карточка — шаблон + только свой текст."""
+    q = update.inline_query
+    user = q.from_user
+    try:
+        if is_user_banned(user.id):
+            await q.answer([], cache_time=1, is_personal=True)
+            return
+        save_user(user.id, user.username, user.first_name)
+        try:
+            balance = await asyncio.to_thread(vb.get_balance, user.id)
+        except vb.BufferError as e:
+            logging.error(f"inline balance: {e}")
+            await q.answer([
+                InlineQueryResultArticle(
+                    id="err",
+                    title="Буфер недоступен",
+                    input_message_content=InputTextMessageContent("Не удалось получить баланс. Попробуйте позже."),
+                )
+            ], cache_time=1, is_personal=True)
+            return
+
+        name = _display_name(user)
+        status = _status_label(user)
+        spam = (time.time() - _inline_last_ts.get(user.id, 0)) < 2.5
+        tree = cards.tree_full(name, status, balance)
+        first = tree if spam else cards.tree_frames(name, status, balance)[0]
+        results = []
+
+        try:
+            png = await _make_profile_png(context.bot, user, balance)
+            file_id = await _upload_card_file_id(context.bot, png, f"{user.id}:{balance}")
+            if file_id:
+                results.append(InlineQueryResultCachedPhoto(
+                    id="card",
+                    photo_file_id=file_id,
+                    title="Карточка",
+                    description=f"{name} · {balance} виол",
+                    caption=tree,
+                ))
+        except Exception as e:
+            logging.info(f"inline card: {e}")
+
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("·", callback_data="inl_keep")]])
+        results.append(InlineQueryResultArticle(
+            id="tree",
+            title="Баланс",
+            description=f"{name} · {balance} виол",
+            input_message_content=InputTextMessageContent(first),
+            reply_markup=kb,
+        ))
+        results.append(InlineQueryResultArticle(
+            id="profile",
+            title="Профиль",
+            description=status,
+            input_message_content=InputTextMessageContent(tree if spam else first),
+            reply_markup=kb,
+        ))
+        await q.answer(
+            results, cache_time=1, is_personal=True,
+            switch_pm_text="открыть бота", switch_pm_parameter="from_inline",
+        )
+    except Exception as e:
+        logging.error(f"inline_query: {e}")
+        try:
+            await q.answer([
+                InlineQueryResultArticle(
+                    id="fail",
+                    title="Ошибка",
+                    input_message_content=InputTextMessageContent("Не удалось показать баланс."),
+                )
+            ], cache_time=1, is_personal=True)
+        except Exception:
+            pass
+
+
+async def chosen_inline_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Анимация дерева после выбора инлайна. В чужих ЛС edit может не пройти — тогда уже отдан финал."""
+    res = update.chosen_inline_result
+    user = res.from_user
+    _inline_last_ts[user.id] = time.time()
+    if res.result_id not in ("tree", "profile"):
+        return
+    mid = getattr(res, "inline_message_id", None)
+    if not mid:
+        return
+    try:
+        balance = await asyncio.to_thread(vb.get_balance, user.id)
+    except vb.BufferError:
+        return
+    frames = cards.tree_frames(_display_name(user), _status_label(user), balance)
+    spam = False
+    try:
+        await animate_tree(context.bot, None, None, frames, spam=spam, inline_message_id=mid)
+    except Exception as e:
+        logging.info(f"inline animate: {e}")
+        try:
+            await context.bot.edit_message_text(frames[-1], inline_message_id=mid)
+        except Exception:
+            pass
+
+
 def main():
     if not all([BOT_TOKEN, ADMIN_ID]):
         logging.critical("КРИТИЧЕСКАЯ ОШИБКА: не установлены BOT_TOKEN и/или ADMIN_ID")
@@ -4842,10 +5220,14 @@ def main():
     # перехватываем в группе -1, раньше всех: сообщения из business-чатов
     # не должны попадать в обычную логику бота.
     application.add_handler(TypeHandler(Update, asr_business_guard), group=-1)
+    application.add_handler(ChatMemberHandler(asr_chat_member, ChatMemberHandler.ANY_CHAT_MEMBER), group=-2)
+    application.add_handler(MessageHandler(filters.ALL, asr_relay_guard), group=-1)
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CommandHandler("balance", balance_command))
+    application.add_handler(InlineQueryHandler(inline_query_handler))
+    application.add_handler(ChosenInlineResultHandler(chosen_inline_handler))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     media_filters = filters.PHOTO | filters.VIDEO | filters.VOICE | filters.Document.ALL | filters.VIDEO_NOTE
