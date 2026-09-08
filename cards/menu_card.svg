@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 420 150" width="420" height="150">
+  <defs>
+    <linearGradient id="lux" x1="0" y1="0" x2="1" y2="1"><stop offset="0%" stop-color="#2D0B4E"/><stop offset="40%" stop-color="#5E1A8A"/><stop offset="100%" stop-color="#00BCD4"/></linearGradient>
+    <radialGradient id="orchid" cx="50%" cy="50%" r="50%"><stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.95"/><stop offset="50%" stop-color="#E1F5FE" stop-opacity="0.3"/><stop offset="100%" stop-color="#2D0B4E" stop-opacity="0"/></radialGradient>
+  </defs>
+  <rect x="0" y="0" width="420" height="150" rx="26" ry="26" fill="#0B0B12" stroke="#2A1045" stroke-width="1"/>
+  <ellipse cx="370" cy="45" rx="70" ry="55" fill="url(#orchid)" opacity="0.9"/>
+  <circle cx="370" cy="45" r="24" fill="#FFFFFF"/>
+  <polygon points="370,32 375,45 370,55 365,45" fill="#0B0B12" opacity="0.9"/>
+
+  <rect x="28" y="30" width="130" height="42" rx="21" ry="21" fill="url(#lux)" opacity="0.9"/>
+  <text x="93" y="57" text-anchor="middle" font-family="system-ui,sans-serif" font-weight="800" font-size="15" fill="#fff" letter-spacing="1">ГЛАВНОЕ</text>
+
+  <rect x="176" y="30" width="200" height="42" rx="21" ry="21" fill="#161625" stroke="#5E1A8A" stroke-width="1.2"/>
+  <text x="276" y="57" text-anchor="middle" font-family="system-ui,sans-serif" font-weight="700" font-size="15" fill="#EAEAEA">МЕНЮ</text>
+
+  <rect x="28" y="88" width="120" height="36" rx="18" ry="18" fill="#161625" stroke="#00BCD4" stroke-width="1"/>
+  <text x="88" y="112" text-anchor="middle" font-family="system-ui,sans-serif" font-weight="800" font-size="13" fill="#00BCD4">БАЛАНС</text>
+
+  <rect x="164" y="88" width="110" height="36" rx="18" ry="18" fill="url(#lux)" opacity="0.85"/>
+  <text x="219" y="112" text-anchor="middle" font-family="system-ui,sans-serif" font-weight="800" font-size="13" fill="#fff">ПРОФИЛЬ</text>
+
+  <rect x="288" y="88" width="100" height="36" rx="18" ry="18" fill="#161625" stroke="#FFD24A" stroke-width="1"/>
+  <text x="338" y="112" text-anchor="middle" font-family="system-ui,sans-serif" font-weight="800" font-size="12" fill="#FFD24A">ЭКОНОМ</text>
+</svg>
